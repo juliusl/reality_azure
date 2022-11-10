@@ -1,4 +1,5 @@
-use azure_storage_blobs::prelude::{BlobBlockType, BlockList, ContainerClient};
+use azure_core::request_options::Range;
+use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockList, ContainerClient};
 use bytes::Bytes;
 use futures::{future::try_join_all, StreamExt};
 use reality::{
@@ -7,8 +8,10 @@ use reality::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::{Cursor, Write},
+    io::Cursor,
+    sync::Arc,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, Level};
 
 /// Struct for uploading/fetching protocol data from azure storage,
@@ -83,6 +86,7 @@ impl Store {
     ) -> bool {
         let prefix = format!("{}/store", prefix.as_ref());
         let blob_client = container_client.blob_client(prefix);
+        let blob_client = Arc::new(blob_client);
 
         if let Some(etag) = self.last_fetched.as_ref() {
             let current = blob_client.get_metadata().await.unwrap().etag;
@@ -114,32 +118,17 @@ impl Store {
                     match (frame.name(&interner), frame.symbol(&interner)) {
                         (Some(name), Some(symbol)) => match (name.as_str(), symbol.as_str()) {
                             ("store", "control") => {
-                                let control_size = block.size_in_bytes;
+                                let mut reader = Self::pull_byte_range(
+                                    blob_client.clone(),
+                                    0..block.size_in_bytes,
+                                );
+
                                 let mut control_device = ControlDevice::default();
 
-                                let mut buffer = Cursor::new(vec![]);
-                                let mut stream =
-                                    blob_client.get().range(0..control_size).into_stream();
-                                while let Some(resp) = stream.next().await {
-                                    match resp {
-                                        Ok(r) => {
-                                            let reader = r
-                                                .data
-                                                .collect()
-                                                .await
-                                                .expect("should be able to read");
-                                            buffer.write_all(reader.as_ref()).ok();
-                                        }
-                                        Err(err) => {
-                                            event!(Level::ERROR, "Error reading range, {err}")
-                                        }
-                                    }
-                                }
-
-                                buffer.set_position(0);
-
-                                for frame in buffer.into_inner().chunks(64) {
-                                    let frame = Frame::from(frame.as_ref());
+                                let mut buffer = [0; 64];
+                                while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                    assert_eq!(r, 64);
+                                    let frame = Frame::from(buffer.as_ref());
                                     if frame.op() == 0x00 {
                                         control_device.data.push(frame.clone());
                                     } else if frame.op() > 0x00 && frame.op() < 0x06 {
@@ -151,6 +140,7 @@ impl Store {
                                         );
                                         control_device.index.push(frame.clone());
                                     }
+                                    buffer = [0; 64];
                                 }
 
                                 interner = interner.merge(&control_device.into());
@@ -173,6 +163,7 @@ impl Store {
 
         // Build objects
         let mut offset = 0;
+        let mut current_encoder = None::<ResourceId>;
         for block in block_list.block_with_size_list.blocks.iter() {
             match &block.block_list_type {
                 BlobBlockType::Committed(frame) => {
@@ -182,49 +173,51 @@ impl Store {
                             match (name.as_ref(), symbol.as_ref()) {
                                 ("store", "control") => {}
                                 ("store", symbol) => {
-                                    if let Some(current_encoder) = self
+                                    if let Some((id, Some(encoder))) = self
                                         .reverse_index
                                         .get(symbol)
-                                        .and_then(|id| self.protocol.encoder_mut_by_id(id.clone()))
+                                        .and_then(|id| Some((id, self.protocol.encoder_mut_by_id(id.clone()))))
                                     {
-                                        let mut buffer = Cursor::new(vec![]);
-                                        let mut stream = blob_client
-                                            .get()
-                                            .range(offset..offset + block.size_in_bytes)
-                                            .into_stream();
-                                        while let Some(resp) = stream.next().await {
-                                            match resp {
-                                                Ok(r) => {
-                                                    let reader = r
-                                                        .data
-                                                        .collect()
-                                                        .await
-                                                        .expect("should be able to read");
-                                                    buffer.write_all(reader.as_ref()).ok();
-                                                }
-                                                Err(err) => {
-                                                    event!(
-                                                        Level::ERROR,
-                                                        "Error reading range, {err}"
-                                                    )
-                                                }
-                                            }
-                                        }
-                                        buffer.set_position(0);
+                                        let mut reader = Self::pull_byte_range(
+                                            blob_client.clone(),
+                                            offset..offset + block.size_in_bytes,
+                                        );
 
-                                        for frame in buffer.into_inner().chunks(64) {
-                                            let frame = Frame::from(frame.as_ref());
-                                            current_encoder.frames.push(frame);
+                                        let mut buffer = [0; 64];
+                                        while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                            assert_eq!(r, 64);
+                                            let frame = Frame::from(buffer);
+                                            encoder.frames.push(frame);
+                                            buffer = [0; 64];
                                         }
 
-                                        current_encoder.interner = interner.clone();
+                                        encoder.interner = interner.clone();
+
+                                        current_encoder = Some(id.clone());
                                     }
                                 }
                                 _ => {}
                             }
                         }
-                        // TOOD: Lazy pull blob data
-                        _ => todo!("build blob device"),
+                        _ if frame.is_extent() => {
+                            if let Some(encoder) = current_encoder.as_ref().and_then(|id| self.protocol.encoder_mut_by_id(id.clone())) {
+                                let mut reader = Self::pull_byte_range(
+                                    blob_client.clone(),
+                                    offset..offset + block.size_in_bytes,
+                                );
+
+                                match tokio::io::copy(&mut reader, &mut encoder.blob_device).await {
+                                    Ok(copied) => {
+                                        assert_eq!(copied, block.size_in_bytes);
+                                        event!(Level::TRACE, "Copied, {copied}");
+                                    },
+                                    Err(err) => {
+                                        event!(Level::ERROR, "Could not copy bytes into blob device, {err}");
+                                    },
+                                };
+                            }
+                        }
+                        _ => panic!("Unrecognized frame"),
                     }
                 }
                 _ => {}
@@ -306,7 +299,7 @@ impl Store {
                         }
                     }
 
-                    match buffer.write_all(frame.bytes()) {
+                    match std::io::Write::write_all(&mut buffer, frame.bytes()) {
                         Ok(_) => {}
                         Err(err) => {
                             event!(Level::ERROR, "Could not write to buffer, {err}");
@@ -330,19 +323,13 @@ impl Store {
         let control_frame = Frame::extension("store", "control");
         let mut buffer = Cursor::new(vec![]);
         for d in control_device.data {
-            buffer
-                .write_all(d.bytes())
-                .expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
         for d in control_device.read {
-            buffer
-                .write_all(d.bytes())
-                .expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
         for d in control_device.index {
-            buffer
-                .write_all(d.bytes())
-                .expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
         let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
         upload_block_futures.push(
@@ -385,6 +372,43 @@ impl Store {
                 event!(Level::ERROR, "Could not take commit store, {err}");
             }
         }
+    }
+}
+
+/// Functions to work w/ blobs,
+///
+impl Store {
+    /// Returns the other end of a duplex stream to read bytes from,
+    ///
+    fn pull_byte_range(blob_client: Arc<BlobClient>, range: impl Into<Range>) -> DuplexStream {
+        let range = range.into();
+
+        let size = range.end - range.start;
+
+        let (mut writer, reader) = tokio::io::duplex(size as usize);
+
+        tokio::spawn(async move {
+            let blob_client = blob_client;
+            let mut stream = blob_client.get().range(range).into_stream();
+            while let Some(resp) = stream.next().await {
+                match resp {
+                    Ok(r) => {
+                        let reader = r.data.collect().await.expect("should be able to read");
+                        match writer.write_all(reader.as_ref()).await {
+                            Ok(_) => {}
+                            Err(err) => {
+                                event!(Level::ERROR, "Could not write bytes {err}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        event!(Level::ERROR, "Error reading range, {err}")
+                    }
+                }
+            }
+        });
+
+        reader
     }
 }
 
