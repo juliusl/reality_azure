@@ -125,7 +125,7 @@ impl Store {
         if let Some(etag) = self.last_fetched.as_ref() {
             let current = blob_client.get_metadata().await.unwrap().etag;
             if *etag == current {
-                event!(Level::INFO, "Already up to date, skipping fetch");
+                event!(Level::DEBUG, "Already up to date, skipping fetch");
                 return false;
             }
         }
