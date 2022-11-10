@@ -1,4 +1,7 @@
-use azure_core::{auth::TokenCredential, request_options::Range};
+use azure_core::{
+    auth::TokenCredential,
+    request_options::{LeaseId, Range},
+};
 use azure_identity::AzureCliCredential;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{
@@ -14,6 +17,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io::Cursor,
     sync::Arc,
+    time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
@@ -36,6 +40,9 @@ pub struct Store {
     /// Storage container client,
     ///
     container_client: Option<Arc<ContainerClient>>,
+    /// Current lease id,
+    ///
+    lease_id: Option<LeaseId>,
 }
 
 impl Store {
@@ -110,6 +117,47 @@ impl Store {
         }
     }
 
+    pub async fn take(&mut self, prefix: impl AsRef<str>, timeout: Option<Duration>) -> bool {
+        let container_client = self
+            .container_client
+            .as_ref()
+            .clone()
+            .expect("should be authenticated to commit the store");
+        let prefix = format!("{}/store", prefix.as_ref());
+        let blob_client = container_client.blob_client(&prefix);
+        let blob_client = Arc::new(blob_client);
+
+        let lease = if let Some(timeout) = timeout {
+            blob_client.acquire_lease(timeout).await
+        } else {
+            blob_client.acquire_lease(Duration::from_secs(300)).await
+        };
+
+        match lease {
+            Ok(lease) => {
+                self.lease_id = Some(lease.lease_id);
+            }
+            Err(err) => {
+                event!(Level::ERROR, "Could not acuire lease, {err}");
+                return false;
+            }
+        }
+
+        if self.fetch(prefix).await {
+            let lease_id = self.lease_id.take().expect("should have a lease id");
+            match blob_client.delete().lease_id(lease_id).await {
+                Ok(_) => {}
+                Err(err) => {
+                    event!(Level::ERROR, "Could not delete blob, {err}");
+                }
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns the latest version of the store,
     ///
     pub async fn fetch(&mut self, prefix: impl AsRef<str>) -> bool {
@@ -123,14 +171,19 @@ impl Store {
         let blob_client = Arc::new(blob_client);
 
         if let Some(etag) = self.last_fetched.as_ref() {
-            let current = blob_client.get_metadata().await.unwrap().etag;
+            let current = Self::etag(blob_client.clone(), self.lease_id).await;
             if *etag == current {
                 event!(Level::DEBUG, "Already up to date, skipping fetch");
                 return false;
             }
         }
 
-        if let Some(block_list) = blob_client.get_block_list().await.ok() {
+        let mut block_list = blob_client.get_block_list();
+        if let Some(lease_id) = self.lease_id {
+            block_list = block_list.lease_id(lease_id);
+        }
+
+        if let Some(block_list) = block_list.await.ok() {
             let mut interner = Interner::default();
             interner.add_ident("store");
             interner.add_ident("control");
@@ -151,6 +204,7 @@ impl Store {
                                     let mut reader = Self::pull_byte_range(
                                         blob_client.clone(),
                                         0..block.size_in_bytes,
+                                        self.lease_id,
                                     );
 
                                     let mut control_device = ControlDevice::default();
@@ -216,6 +270,7 @@ impl Store {
                                             let mut reader = Self::pull_byte_range(
                                                 blob_client.clone(),
                                                 offset..offset + block.size_in_bytes,
+                                                self.lease_id,
                                             );
 
                                             let mut buffer = [0; 64];
@@ -242,6 +297,7 @@ impl Store {
                                     let mut reader = Self::pull_byte_range(
                                         blob_client.clone(),
                                         offset..offset + block.size_in_bytes,
+                                        self.lease_id,
                                     );
 
                                     match tokio::io::copy(&mut reader, &mut encoder.blob_device)
@@ -269,7 +325,7 @@ impl Store {
                 offset += block.size_in_bytes;
             }
 
-            self.last_fetched = Some(blob_client.get_metadata().await.unwrap().etag);
+            self.last_fetched = Some(Self::etag(blob_client, self.lease_id).await);
             true
         } else {
             false
@@ -313,7 +369,11 @@ impl Store {
         let mut objects = vec![];
         let mut upload_block_futures = vec![];
 
-        for (resource_id, encoder) in self.protocol.iter_encoders().filter(|(_, e)| !e.frames.is_empty()) {
+        for (resource_id, encoder) in self
+            .protocol
+            .iter_encoders()
+            .filter(|(_, e)| !e.frames.is_empty())
+        {
             if let Some(name) = self.index.get(resource_id) {
                 /*
                   ## Wire objects
@@ -342,10 +402,14 @@ impl Store {
                             let start = cursor as usize;
                             let end = start + length as usize;
                             let block_id = Bytes::copy_from_slice(frame.bytes());
-                            let task = blob_client.put_block(
+
+                            let mut task = blob_client.put_block(
                                 block_id.clone(),
                                 Bytes::copy_from_slice(&encoder.blob_device.get_ref()[start..end]),
                             );
+                            if let Some(lease_id) = self.lease_id.as_ref() {
+                                task = task.lease_id(*lease_id);
+                            }
                             upload_block_futures.push(task.into_future());
                             block_list.push_back(BlobBlockType::new_uncommitted(block_id));
                         }
@@ -361,8 +425,11 @@ impl Store {
 
                 // Prepend the object's store frame to the block list and upload it's frames
                 let block_id = Bytes::copy_from_slice(encoder_frame.bytes());
-                let upload =
+                let mut upload =
                     blob_client.put_block(block_id.clone(), Bytes::from(buffer.into_inner()));
+                if let Some(lease_id) = self.lease_id.as_ref() {
+                    upload = upload.lease_id(*lease_id);
+                }
                 upload_block_futures.push(upload.into_future());
                 block_list.push_front(BlobBlockType::new_uncommitted(block_id));
 
@@ -384,11 +451,11 @@ impl Store {
             std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
         let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
-        upload_block_futures.push(
-            blob_client
-                .put_block(control_block_id.clone(), buffer.into_inner())
-                .into_future(),
-        );
+        let mut upload = blob_client.put_block(control_block_id.clone(), buffer.into_inner());
+        if let Some(lease_id) = self.lease_id {
+            upload = upload.lease_id(lease_id)
+        }
+        upload_block_futures.push(upload.into_future());
 
         // Finish upload blobs
         match try_join_all(upload_block_futures).await {
@@ -405,7 +472,11 @@ impl Store {
             .blocks
             .insert(0, BlobBlockType::new_uncommitted(control_block_id));
 
-        match blob_client.put_block_list(block_list).await {
+        let mut request = blob_client.put_block_list(block_list);
+        if let Some(lease_id) = self.lease_id {
+            request = request.lease_id(lease_id)
+        }
+        match request.await {
             Ok(_) => {}
             Err(err) => {
                 event!(Level::ERROR, "Could not put block list, {err}");
@@ -424,7 +495,12 @@ impl Store {
 
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
-        match blob_client.snapshot().await {
+        let mut request = blob_client.snapshot();
+        if let Some(lease_id) = self.lease_id {
+            request = request.lease_id(lease_id)
+        }
+
+        match request.await {
             Ok(_) => {}
             Err(err) => {
                 event!(Level::ERROR, "Could not take commit store, {err}");
@@ -436,9 +512,23 @@ impl Store {
 /// Functions to work w/ blobs,
 ///
 impl Store {
+    /// Returns current etag,
+    ///
+    async fn etag(blob_client: Arc<BlobClient>, lease_id: Option<LeaseId>) -> String {
+        let mut current = blob_client.get_metadata();
+        if let Some(lease_id) = lease_id.as_ref() {
+            current = current.lease_id(*lease_id);
+        }
+        current.await.expect("should have metadata").etag
+    }
+
     /// Returns the other end of a duplex stream to read bytes from,
     ///
-    fn pull_byte_range(blob_client: Arc<BlobClient>, range: impl Into<Range>) -> DuplexStream {
+    fn pull_byte_range(
+        blob_client: Arc<BlobClient>,
+        range: impl Into<Range>,
+        lease_id: Option<LeaseId>,
+    ) -> DuplexStream {
         let range = range.into();
 
         let size = range.end - range.start;
@@ -447,7 +537,12 @@ impl Store {
 
         tokio::spawn(async move {
             let blob_client = blob_client;
-            let mut stream = blob_client.get().range(range).into_stream();
+            let mut request = blob_client.get();
+            if let Some(lease_id) = lease_id.as_ref() {
+                request = request.lease_id(*lease_id);
+            }
+
+            let mut stream = request.range(range).into_stream();
             while let Some(resp) = stream.next().await {
                 match resp {
                     Ok(r) => {
@@ -478,6 +573,7 @@ impl Default for Store {
             reverse_index: Default::default(),
             last_fetched: None,
             container_client: None,
+            lease_id: None,
         }
     }
 }
