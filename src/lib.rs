@@ -313,7 +313,7 @@ impl Store {
         let mut objects = vec![];
         let mut upload_block_futures = vec![];
 
-        for (resource_id, encoder) in self.protocol.iter_encoders() {
+        for (resource_id, encoder) in self.protocol.iter_encoders().filter(|(_, e)| !e.frames.is_empty()) {
             if let Some(name) = self.index.get(resource_id) {
                 /*
                   ## Wire objects
