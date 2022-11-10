@@ -1,7 +1,9 @@
-use azure_core::{request_options::Range, auth::TokenCredential};
+use azure_core::{auth::TokenCredential, request_options::Range};
 use azure_identity::AzureCliCredential;
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockList, ContainerClient, BlobServiceClient};
+use azure_storage_blobs::prelude::{
+    BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient,
+};
 use bytes::Bytes;
 use futures::{future::try_join_all, StreamExt};
 use reality::{
@@ -14,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tracing::{event, Level, trace};
+use tracing::{event, trace, Level};
 
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
@@ -32,7 +34,7 @@ pub struct Store {
     ///
     last_fetched: Option<String>,
     /// Storage container client,
-    /// 
+    ///
     container_client: Option<Arc<ContainerClient>>,
 }
 
@@ -44,14 +46,14 @@ impl Store {
     }
 
     /// Returns store with a container client,
-    /// 
+    ///
     pub fn with_login(mut self, container_client: ContainerClient) -> Self {
         self.container_client = Some(Arc::new(container_client));
         self
     }
 
     /// Login to azure and return an authenticated store,
-    /// 
+    ///
     pub async fn login_azcli(account_name: impl AsRef<str>, container: impl AsRef<str>) -> Self {
         let account_name = account_name.as_ref();
         let container_name = container.as_ref();
@@ -110,11 +112,12 @@ impl Store {
 
     /// Returns the latest version of the store,
     ///
-    pub async fn fetch(
-        &mut self,
-        prefix: impl AsRef<str>
-    ) -> bool {
-        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
+    pub async fn fetch(&mut self, prefix: impl AsRef<str>) -> bool {
+        let container_client = self
+            .container_client
+            .as_ref()
+            .clone()
+            .expect("should be authenticated to commit the store");
         let prefix = format!("{}/store", prefix.as_ref());
         let blob_client = container_client.blob_client(prefix);
         let blob_client = Arc::new(blob_client);
@@ -127,144 +130,150 @@ impl Store {
             }
         }
 
-        let block_list = blob_client
-            .get_block_list()
-            .await
-            .expect("should have block list");
+        if let Some(block_list) = blob_client.get_block_list().await.ok() {
+            let mut interner = Interner::default();
+            interner.add_ident("store");
+            interner.add_ident("control");
 
-        let mut interner = Interner::default();
-        interner.add_ident("store");
-        interner.add_ident("control");
+            let mut encoder_map = HashMap::<ResourceId, Encoder>::default();
+            for (id, _) in self.protocol.iter_encoders() {
+                encoder_map.insert(id.clone(), Encoder::default());
+            }
 
-        let mut encoder_map = HashMap::<ResourceId, Encoder>::default();
-        for (id, _) in self.protocol.iter_encoders() {
-            encoder_map.insert(id.clone(), Encoder::default());
-        }
+            // Build control device
+            for block in block_list.block_with_size_list.blocks.iter() {
+                match &block.block_list_type {
+                    BlobBlockType::Committed(frame) => {
+                        let frame = Frame::from(frame.as_ref());
+                        match (frame.name(&interner), frame.symbol(&interner)) {
+                            (Some(name), Some(symbol)) => match (name.as_str(), symbol.as_str()) {
+                                ("store", "control") => {
+                                    let mut reader = Self::pull_byte_range(
+                                        blob_client.clone(),
+                                        0..block.size_in_bytes,
+                                    );
 
-        // Build control device
-        for block in block_list.block_with_size_list.blocks.iter() {
-            match &block.block_list_type {
-                BlobBlockType::Committed(frame) => {
-                    let frame = Frame::from(frame.as_ref());
-                    match (frame.name(&interner), frame.symbol(&interner)) {
-                        (Some(name), Some(symbol)) => match (name.as_str(), symbol.as_str()) {
-                            ("store", "control") => {
-                                let mut reader = Self::pull_byte_range(
-                                    blob_client.clone(),
-                                    0..block.size_in_bytes,
-                                );
+                                    let mut control_device = ControlDevice::default();
 
-                                let mut control_device = ControlDevice::default();
-
-                                let mut buffer = [0; 64];
-                                while let Ok(r) = reader.read_exact(&mut buffer).await {
-                                    assert_eq!(r, 64);
-                                    let frame = Frame::from(buffer.as_ref());
-                                    if frame.op() == 0x00 {
-                                        control_device.data.push(frame.clone());
-                                    } else if frame.op() > 0x00 && frame.op() < 0x06 {
-                                        control_device.read.push(frame.clone());
-                                    } else if frame.op() >= 0xC1 && frame.op() <= 0xC6 {
-                                        assert!(
-                                            frame.op() >= 0xC1 && frame.op() <= 0xC6,
-                                            "Index frames have a specific op code range"
-                                        );
-                                        control_device.index.push(frame.clone());
+                                    let mut buffer = [0; 64];
+                                    while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                        assert_eq!(r, 64);
+                                        let frame = Frame::from(buffer.as_ref());
+                                        if frame.op() == 0x00 {
+                                            control_device.data.push(frame.clone());
+                                        } else if frame.op() > 0x00 && frame.op() < 0x06 {
+                                            control_device.read.push(frame.clone());
+                                        } else if frame.op() >= 0xC1 && frame.op() <= 0xC6 {
+                                            assert!(
+                                                frame.op() >= 0xC1 && frame.op() <= 0xC6,
+                                                "Index frames have a specific op code range"
+                                            );
+                                            control_device.index.push(frame.clone());
+                                        }
+                                        buffer = [0; 64];
                                     }
-                                    buffer = [0; 64];
-                                }
 
-                                interner = interner.merge(&control_device.into());
-                            }
+                                    interner = interner.merge(&control_device.into());
+                                }
+                                _ => {
+                                    // All control device blocks are in the front
+                                    break;
+                                }
+                            },
                             _ => {
-                                // All control device blocks are in the front
                                 break;
                             }
-                        },
-                        _ => {
-                            break;
                         }
                     }
-                }
-                _ => {
-                    break;
+                    _ => {
+                        break;
+                    }
                 }
             }
-        }
 
-        // Build objects
-        let mut offset = 0;
-        let mut current_encoder = None::<ResourceId>;
-        for block in block_list.block_with_size_list.blocks.iter() {
-            match &block.block_list_type {
-                BlobBlockType::Committed(frame) => {
-                    let frame = Frame::from(frame.as_ref());
-                    match (frame.name(&interner), frame.symbol(&interner)) {
-                        (Some(name), Some(symbol)) if frame.keyword() == Keywords::Extension => {
-                            match (name.as_ref(), symbol.as_ref()) {
-                                ("store", "control") => {}
-                                ("store", symbol) => {
-                                    if let Some((id, Some(encoder))) =
-                                        self.reverse_index.get(symbol).and_then(|id| {
-                                            Some((id, self.protocol.encoder_mut_by_id(id.clone())))
-                                        })
-                                    {
-                                        let mut reader = Self::pull_byte_range(
-                                            blob_client.clone(),
-                                            offset..offset + block.size_in_bytes,
-                                        );
-
-                                        let mut buffer = [0; 64];
-                                        while let Ok(r) = reader.read_exact(&mut buffer).await {
-                                            assert_eq!(r, 64);
-                                            let frame = Frame::from(buffer);
-                                            encoder.frames.push(frame);
-                                            buffer = [0; 64];
-                                        }
-
-                                        encoder.interner = interner.clone();
-
-                                        current_encoder = Some(id.clone());
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ if frame.is_extent() => {
-                            if let Some(encoder) = current_encoder
-                                .as_ref()
-                                .and_then(|id| self.protocol.encoder_mut_by_id(id.clone()))
+            // Build objects
+            let mut offset = 0;
+            let mut current_encoder = None::<ResourceId>;
+            for block in block_list.block_with_size_list.blocks.iter() {
+                match &block.block_list_type {
+                    BlobBlockType::Committed(frame) => {
+                        let frame = Frame::from(frame.as_ref());
+                        match (frame.name(&interner), frame.symbol(&interner)) {
+                            (Some(name), Some(symbol))
+                                if frame.keyword() == Keywords::Extension =>
                             {
-                                let mut reader = Self::pull_byte_range(
-                                    blob_client.clone(),
-                                    offset..offset + block.size_in_bytes,
-                                );
+                                match (name.as_ref(), symbol.as_ref()) {
+                                    ("store", "control") => {}
+                                    ("store", symbol) => {
+                                        if let Some((id, Some(encoder))) =
+                                            self.reverse_index.get(symbol).and_then(|id| {
+                                                Some((
+                                                    id,
+                                                    self.protocol.encoder_mut_by_id(id.clone()),
+                                                ))
+                                            })
+                                        {
+                                            let mut reader = Self::pull_byte_range(
+                                                blob_client.clone(),
+                                                offset..offset + block.size_in_bytes,
+                                            );
 
-                                match tokio::io::copy(&mut reader, &mut encoder.blob_device).await {
-                                    Ok(copied) => {
-                                        assert_eq!(copied, block.size_in_bytes);
-                                        event!(Level::TRACE, "Copied, {copied}");
+                                            let mut buffer = [0; 64];
+                                            while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                                assert_eq!(r, 64);
+                                                let frame = Frame::from(buffer);
+                                                encoder.frames.push(frame);
+                                                buffer = [0; 64];
+                                            }
+
+                                            encoder.interner = interner.clone();
+
+                                            current_encoder = Some(id.clone());
+                                        }
                                     }
-                                    Err(err) => {
-                                        event!(
-                                            Level::ERROR,
-                                            "Could not copy bytes into blob device, {err}"
-                                        );
-                                    }
-                                };
+                                    _ => {}
+                                }
                             }
-                        }
-                        _ => panic!("Unrecognized frame"),
-                    }
-                }
-                _ => {}
-            }
-            // Keep track of offset, so that blob reads can do range queries
-            offset += block.size_in_bytes;
-        }
+                            _ if frame.is_extent() => {
+                                if let Some(encoder) = current_encoder
+                                    .as_ref()
+                                    .and_then(|id| self.protocol.encoder_mut_by_id(id.clone()))
+                                {
+                                    let mut reader = Self::pull_byte_range(
+                                        blob_client.clone(),
+                                        offset..offset + block.size_in_bytes,
+                                    );
 
-        self.last_fetched = Some(blob_client.get_metadata().await.unwrap().etag);
-        return true;
+                                    match tokio::io::copy(&mut reader, &mut encoder.blob_device)
+                                        .await
+                                    {
+                                        Ok(copied) => {
+                                            assert_eq!(copied, block.size_in_bytes);
+                                            event!(Level::TRACE, "Copied, {copied}");
+                                        }
+                                        Err(err) => {
+                                            event!(
+                                                Level::ERROR,
+                                                "Could not copy bytes into blob device, {err}"
+                                            );
+                                        }
+                                    };
+                                }
+                            }
+                            _ => panic!("Unrecognized frame"),
+                        }
+                    }
+                    _ => {}
+                }
+                // Keep track of offset, so that blob reads can do range queries
+                offset += block.size_in_bytes;
+            }
+
+            self.last_fetched = Some(blob_client.get_metadata().await.unwrap().etag);
+            true
+        } else {
+            false
+        }
     }
 
     /// Uploading store,
@@ -291,7 +300,11 @@ impl Store {
     ///
     ///
     pub async fn upload(&self, prefix: impl AsRef<str>) {
-        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
+        let container_client = self
+            .container_client
+            .as_ref()
+            .clone()
+            .expect("should be authenticated to commit the store");
 
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
@@ -403,7 +416,11 @@ impl Store {
     /// Commits the store blob,
     ///
     pub async fn commit(&self, prefix: impl AsRef<str>) {
-        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
+        let container_client = self
+            .container_client
+            .as_ref()
+            .clone()
+            .expect("should be authenticated to commit the store");
 
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
