@@ -117,6 +117,8 @@ impl Store {
         }
     }
 
+    /// Takes the uploaded store blob data if successfully fetched,
+    /// 
     pub async fn take(&mut self, prefix: impl AsRef<str>, timeout: Option<Duration>) -> bool {
         let container_client = self
             .container_client
