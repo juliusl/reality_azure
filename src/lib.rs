@@ -154,6 +154,15 @@ impl Store {
 
             true
         } else {
+            let lease_id = self.lease_id.take().expect("should have a lease id");
+            match blob_client.blob_lease_client(lease_id).release().await {
+                Ok(_) => {
+                    
+                },
+                Err(err) => {
+                    event!(Level::ERROR, "Could not release lease {err}");
+                },
+            }
             false
         }
     }
