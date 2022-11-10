@@ -125,8 +125,7 @@ impl Store {
             .as_ref()
             .clone()
             .expect("should be authenticated to commit the store");
-        let prefix = format!("{}/store", prefix.as_ref());
-        let blob_client = container_client.blob_client(&prefix);
+        let blob_client = container_client.blob_client(&format!("{}/store", prefix.as_ref()));
         let blob_client = Arc::new(blob_client);
 
         let lease = if let Some(timeout) = timeout {
