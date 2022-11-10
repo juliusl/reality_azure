@@ -1,5 +1,7 @@
-use azure_core::request_options::Range;
-use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockList, ContainerClient};
+use azure_core::{request_options::Range, auth::TokenCredential};
+use azure_identity::AzureCliCredential;
+use azure_storage::StorageCredentials;
+use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockList, ContainerClient, BlobServiceClient};
 use bytes::Bytes;
 use futures::{future::try_join_all, StreamExt};
 use reality::{
@@ -12,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tracing::{event, Level};
+use tracing::{event, Level, trace};
 
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
@@ -29,6 +31,9 @@ pub struct Store {
     /// Returns the etag for the last fetched store,
     ///
     last_fetched: Option<String>,
+    /// Storage container client,
+    /// 
+    container_client: Option<Arc<ContainerClient>>,
 }
 
 impl Store {
@@ -36,6 +41,32 @@ impl Store {
     ///
     pub fn empty() -> Self {
         Store::default()
+    }
+
+    /// Returns store with a container client,
+    /// 
+    pub fn with_login(mut self, container_client: ContainerClient) -> Self {
+        self.container_client = Some(Arc::new(container_client));
+        self
+    }
+
+    /// Login to azure and return an authenticated store,
+    /// 
+    pub async fn login_azcli(account_name: impl AsRef<str>, container: impl AsRef<str>) -> Self {
+        let account_name = account_name.as_ref();
+        let container_name = container.as_ref();
+        trace!("Logging into store w/ account: {account_name}");
+
+        let creds = AzureCliCredential::default()
+            .get_token(format!("https://{account_name}.blob.core.windows.net/").as_str())
+            .await
+            .expect("should be able to get token");
+
+        let client = StorageCredentials::bearer_token(creds.token.secret());
+        let client = BlobServiceClient::new(account_name, client);
+        let client = client.container_client(container_name);
+
+        Self::empty().with_login(client)
     }
 
     /// Return objects from the store,
@@ -77,13 +108,13 @@ impl Store {
         }
     }
 
-    /// Returns the latest snapshot of the store,
+    /// Returns the latest version of the store,
     ///
     pub async fn fetch(
         &mut self,
-        prefix: impl AsRef<str>,
-        container_client: &ContainerClient,
+        prefix: impl AsRef<str>
     ) -> bool {
+        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
         let prefix = format!("{}/store", prefix.as_ref());
         let blob_client = container_client.blob_client(prefix);
         let blob_client = Arc::new(blob_client);
@@ -173,10 +204,10 @@ impl Store {
                             match (name.as_ref(), symbol.as_ref()) {
                                 ("store", "control") => {}
                                 ("store", symbol) => {
-                                    if let Some((id, Some(encoder))) = self
-                                        .reverse_index
-                                        .get(symbol)
-                                        .and_then(|id| Some((id, self.protocol.encoder_mut_by_id(id.clone()))))
+                                    if let Some((id, Some(encoder))) =
+                                        self.reverse_index.get(symbol).and_then(|id| {
+                                            Some((id, self.protocol.encoder_mut_by_id(id.clone())))
+                                        })
                                     {
                                         let mut reader = Self::pull_byte_range(
                                             blob_client.clone(),
@@ -200,7 +231,10 @@ impl Store {
                             }
                         }
                         _ if frame.is_extent() => {
-                            if let Some(encoder) = current_encoder.as_ref().and_then(|id| self.protocol.encoder_mut_by_id(id.clone())) {
+                            if let Some(encoder) = current_encoder
+                                .as_ref()
+                                .and_then(|id| self.protocol.encoder_mut_by_id(id.clone()))
+                            {
                                 let mut reader = Self::pull_byte_range(
                                     blob_client.clone(),
                                     offset..offset + block.size_in_bytes,
@@ -210,10 +244,13 @@ impl Store {
                                     Ok(copied) => {
                                         assert_eq!(copied, block.size_in_bytes);
                                         event!(Level::TRACE, "Copied, {copied}");
-                                    },
+                                    }
                                     Err(err) => {
-                                        event!(Level::ERROR, "Could not copy bytes into blob device, {err}");
-                                    },
+                                        event!(
+                                            Level::ERROR,
+                                            "Could not copy bytes into blob device, {err}"
+                                        );
+                                    }
                                 };
                             }
                         }
@@ -253,7 +290,9 @@ impl Store {
     /// <If there are any extents>  0x0A/0x0D   <extents get their own block>
     ///
     ///
-    pub async fn upload(&self, prefix: impl AsRef<str>, container_client: &ContainerClient) {
+    pub async fn upload(&self, prefix: impl AsRef<str>) {
+        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
+
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
         let mut interner = Interner::default();
@@ -363,7 +402,9 @@ impl Store {
 
     /// Commits the store blob,
     ///
-    pub async fn commit(&self, prefix: impl AsRef<str>, container_client: &ContainerClient) {
+    pub async fn commit(&self, prefix: impl AsRef<str>) {
+        let container_client = self.container_client.as_ref().clone().expect("should be authenticated to commit the store");
+
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
         match blob_client.snapshot().await {
@@ -419,6 +460,7 @@ impl Default for Store {
             index: Default::default(),
             reverse_index: Default::default(),
             last_fetched: None,
+            container_client: None,
         }
     }
 }
