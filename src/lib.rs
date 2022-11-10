@@ -118,7 +118,7 @@ impl Store {
     }
 
     /// Takes the uploaded store blob data if successfully fetched,
-    /// 
+    ///
     pub async fn take(&mut self, prefix: impl AsRef<str>, timeout: Option<Duration>) -> bool {
         let container_client = self
             .container_client
@@ -157,12 +157,10 @@ impl Store {
         } else {
             let lease_id = self.lease_id.take().expect("should have a lease id");
             match blob_client.blob_lease_client(lease_id).release().await {
-                Ok(_) => {
-                    
-                },
+                Ok(_) => {}
                 Err(err) => {
                     event!(Level::ERROR, "Could not release lease {err}");
-                },
+                }
             }
             false
         }
@@ -181,10 +179,14 @@ impl Store {
         let blob_client = Arc::new(blob_client);
 
         if let Some(etag) = self.last_fetched.as_ref() {
-            let current = Self::etag(blob_client.clone(), self.lease_id).await;
-            if *etag == current {
-                event!(Level::DEBUG, "Already up to date, skipping fetch");
-                return false;
+            match Self::etag(blob_client.clone(), self.lease_id).await {
+                Some(current) => {
+                    if etag == &current {
+                        event!(Level::DEBUG, "Already up to date, skipping fetch");
+                        return false;
+                    }
+                }
+                None => {}
             }
         }
 
@@ -335,7 +337,7 @@ impl Store {
                 offset += block.size_in_bytes;
             }
 
-            self.last_fetched = Some(Self::etag(blob_client, self.lease_id).await);
+            self.last_fetched = Self::etag(blob_client, self.lease_id).await;
             true
         } else {
             false
@@ -524,12 +526,18 @@ impl Store {
 impl Store {
     /// Returns current etag,
     ///
-    async fn etag(blob_client: Arc<BlobClient>, lease_id: Option<LeaseId>) -> String {
+    async fn etag(blob_client: Arc<BlobClient>, lease_id: Option<LeaseId>) -> Option<String> {
         let mut current = blob_client.get_metadata();
         if let Some(lease_id) = lease_id.as_ref() {
             current = current.lease_id(*lease_id);
         }
-        current.await.expect("should have metadata").etag
+        match current.await {
+            Ok(resp) => Some(resp.etag),
+            Err(err) => {
+                event!(Level::ERROR, "Could not get etag, {err}");
+                None
+            }
+        }
     }
 
     /// Returns the other end of a duplex stream to read bytes from,
