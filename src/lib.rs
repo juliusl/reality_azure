@@ -527,7 +527,7 @@ impl Store {
     ///
     /// If the snapshot cannot be removed, this function will panic to prevent this client from continuing to create snapshots.
     ///
-    pub async fn commit(&mut self, prefix: impl AsRef<str>) {
+    pub async fn commit(&mut self, prefix: impl AsRef<str>) -> bool {
         let container_client = self
             .container_client
             .as_ref()
@@ -535,8 +535,20 @@ impl Store {
             .expect("should be authenticated to commit the store");
 
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
+        let blob_client = Arc::new(blob_client);
+
+        let etag = self.etag(blob_client.clone()).await;
 
         if let Some(snapshot) = self.snapshot.take() {
+            let current = self.etag(blob_client.clone()).await;
+
+            if current == etag {
+                // Skip, creating a snapshot if the data would be the same
+                event!(Level::TRACE, "Skip creating a snapshot if the etag is still the same");
+                self.snapshot = Some(snapshot);
+                return false;
+            }
+
             match blob_client.delete_snapshot(snapshot.clone()).await {
                 Ok(resp) => {
                     event!(
@@ -563,12 +575,12 @@ impl Store {
 
         match request.await {
             Ok(resp) => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-
                 self.snapshot = Some(resp.snapshot);
+                true
             }
             Err(err) => {
                 event!(Level::ERROR, "Could not take commit store, {err}");
+                false
             }
         }
     }
