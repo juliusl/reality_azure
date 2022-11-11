@@ -4,8 +4,9 @@ use azure_core::{
 };
 use azure_identity::AzureCliCredential;
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::{
-    BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient,
+use azure_storage_blobs::{
+    blob::BlockWithSizeList,
+    prelude::{BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient, Snapshot},
 };
 use bytes::Bytes;
 use futures::{future::try_join_all, StreamExt};
@@ -22,8 +23,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
 
-pub use reality::wire::WireObject;
 pub use reality::wire::Encoder;
+pub use reality::wire::WireObject;
 
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
@@ -46,6 +47,9 @@ pub struct Store {
     /// Current lease id,
     ///
     lease_id: Option<LeaseId>,
+    /// Current snapshot,
+    ///
+    snapshot: Option<Snapshot>,
 }
 
 impl Store {
@@ -121,10 +125,10 @@ impl Store {
     }
 
     /// Takes an encoder and replaces with an empty encoder,
-    /// 
-    pub fn take_encoder<W>(&mut self) -> Option<Encoder> 
+    ///
+    pub fn take_encoder<W>(&mut self) -> Option<Encoder>
     where
-        W: WireObject
+        W: WireObject,
     {
         if let Some(mut encoder) = self.protocol.take_encoder(W::resource_id()) {
             self.protocol.ensure_encoder::<W>();
@@ -199,7 +203,7 @@ impl Store {
         let blob_client = Arc::new(blob_client);
 
         if let Some(etag) = self.last_fetched.as_ref() {
-            match Self::etag(blob_client.clone(), self.lease_id).await {
+            match self.etag(blob_client.clone()).await {
                 Some(current) => {
                     if etag == &current {
                         event!(Level::DEBUG, "Already up to date, skipping fetch");
@@ -210,12 +214,7 @@ impl Store {
             }
         }
 
-        let mut block_list = blob_client.get_block_list();
-        if let Some(lease_id) = self.lease_id {
-            block_list = block_list.lease_id(lease_id);
-        }
-
-        if let Some(block_list) = block_list.await.ok() {
+        if let Some(block_list) = self.block_list(blob_client.clone()).await {
             let mut interner = Interner::default();
             interner.add_ident("store");
             interner.add_ident("control");
@@ -226,7 +225,7 @@ impl Store {
             }
 
             // Build control device
-            for block in block_list.block_with_size_list.blocks.iter() {
+            for block in block_list.blocks.iter() {
                 match &block.block_list_type {
                     BlobBlockType::Committed(frame) => {
                         let frame = Frame::from(frame.as_ref());
@@ -237,6 +236,7 @@ impl Store {
                                         blob_client.clone(),
                                         0..block.size_in_bytes,
                                         self.lease_id,
+                                        self.snapshot.clone(),
                                     );
 
                                     let mut control_device = ControlDevice::default();
@@ -280,7 +280,7 @@ impl Store {
             // Build objects
             let mut offset = 0;
             let mut current_encoder = None::<ResourceId>;
-            for block in block_list.block_with_size_list.blocks.iter() {
+            for block in block_list.blocks.iter() {
                 match &block.block_list_type {
                     BlobBlockType::Committed(frame) => {
                         let frame = Frame::from(frame.as_ref());
@@ -304,6 +304,7 @@ impl Store {
                                                 blob_client.clone(),
                                                 offset..offset + block.size_in_bytes,
                                                 self.lease_id,
+                                                self.snapshot.clone(),
                                             );
 
                                             let mut buffer = [0; 64];
@@ -323,30 +324,32 @@ impl Store {
                                 }
                             }
                             _ if frame.is_extent() => {
-                                if let Some(encoder) = current_encoder
-                                    .as_ref()
-                                    .and_then(|id| self.protocol.encoder_mut_by_id(id.clone()))
-                                {
-                                    let mut reader = Self::pull_byte_range(
-                                        blob_client.clone(),
-                                        offset..offset + block.size_in_bytes,
-                                        self.lease_id,
-                                    );
-
-                                    match tokio::io::copy(&mut reader, &mut encoder.blob_device)
-                                        .await
+                                if let Some(id) = current_encoder.as_ref() {
+                                    if let Some(encoder) =
+                                        self.protocol.encoder_mut_by_id(id.clone())
                                     {
-                                        Ok(copied) => {
-                                            assert_eq!(copied, block.size_in_bytes);
-                                            event!(Level::TRACE, "Copied, {copied}");
-                                        }
-                                        Err(err) => {
-                                            event!(
-                                                Level::ERROR,
-                                                "Could not copy bytes into blob device, {err}"
-                                            );
-                                        }
-                                    };
+                                        let mut reader = Self::pull_byte_range(
+                                            blob_client.clone(),
+                                            offset..offset + block.size_in_bytes,
+                                            self.lease_id,
+                                            self.snapshot.clone(),
+                                        );
+
+                                        match tokio::io::copy(&mut reader, &mut encoder.blob_device)
+                                            .await
+                                        {
+                                            Ok(copied) => {
+                                                assert_eq!(copied, block.size_in_bytes);
+                                                event!(Level::TRACE, "Copied, {copied}");
+                                            }
+                                            Err(err) => {
+                                                event!(
+                                                    Level::ERROR,
+                                                    "Could not copy bytes into blob device, {err}"
+                                                );
+                                            }
+                                        };
+                                    }
                                 }
                             }
                             _ => panic!("Unrecognized frame"),
@@ -358,7 +361,7 @@ impl Store {
                 offset += block.size_in_bytes;
             }
 
-            self.last_fetched = Self::etag(blob_client, self.lease_id).await;
+            self.last_fetched = self.etag(blob_client).await;
             true
         } else {
             false
@@ -517,9 +520,14 @@ impl Store {
         }
     }
 
-    /// Commits the store blob,
+    /// Commits the store blob to a snapshot and returns the snapshot,
     ///
-    pub async fn commit(&self, prefix: impl AsRef<str>) {
+    /// Snapshots are only meant for the store instance that took the snapshot, if a snapshot exists when
+    /// this function is called again, it will be removed before creating a new snapshot.
+    ///
+    /// If the snapshot cannot be removed, this function will panic to prevent this client from continuing to create snapshots.
+    ///
+    pub async fn commit(&mut self, prefix: impl AsRef<str>) {
         let container_client = self
             .container_client
             .as_ref()
@@ -528,13 +536,35 @@ impl Store {
 
         let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
 
+        if let Some(snapshot) = self.snapshot.take() {
+            match blob_client.delete_snapshot(snapshot.clone()).await {
+                Ok(resp) => {
+                    event!(
+                        Level::TRACE,
+                        "Deleted previous snapshot, {:?}, request_id: {}",
+                        snapshot,
+                        resp.request_id
+                    );
+                }
+                Err(err) => {
+                    event!(
+                        Level::ERROR,
+                        "Could not release previous snapshot, will panic to prevent leaks. {err}"
+                    );
+                    panic!("Could not delete previous snapshot, {err}");
+                }
+            }
+        }
+
         let mut request = blob_client.snapshot();
         if let Some(lease_id) = self.lease_id {
             request = request.lease_id(lease_id)
         }
 
         match request.await {
-            Ok(_) => {}
+            Ok(resp) => {
+                self.snapshot = Some(resp.snapshot);
+            }
             Err(err) => {
                 event!(Level::ERROR, "Could not take commit store, {err}");
             }
@@ -545,13 +575,40 @@ impl Store {
 /// Functions to work w/ blobs,
 ///
 impl Store {
+    /// Returns the current block list,
+    ///
+    async fn block_list(&self, blob_client: Arc<BlobClient>) -> Option<BlockWithSizeList> {
+        let mut block_list = blob_client.get_block_list();
+        if let Some(lease_id) = self.lease_id {
+            block_list = block_list.lease_id(lease_id);
+        }
+
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            block_list = block_list.blob_versioning(snapshot.clone());
+        }
+
+        match block_list.await {
+            Ok(resp) => Some(resp.block_with_size_list),
+            Err(err) => {
+                event!(Level::ERROR, "Could not get block list {}", err);
+                None
+            }
+        }
+    }
+
     /// Returns current etag,
     ///
-    async fn etag(blob_client: Arc<BlobClient>, lease_id: Option<LeaseId>) -> Option<String> {
+    async fn etag(&self, blob_client: Arc<BlobClient>) -> Option<String> {
         let mut current = blob_client.get_metadata();
-        if let Some(lease_id) = lease_id.as_ref() {
-            current = current.lease_id(*lease_id);
+
+        if let Some(lease_id) = self.lease_id {
+            current = current.lease_id(lease_id);
         }
+
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            current = current.blob_versioning(snapshot.clone());
+        }
+
         match current.await {
             Ok(resp) => Some(resp.etag),
             Err(err) => {
@@ -567,6 +624,7 @@ impl Store {
         blob_client: Arc<BlobClient>,
         range: impl Into<Range>,
         lease_id: Option<LeaseId>,
+        snapshot: Option<Snapshot>,
     ) -> DuplexStream {
         let range = range.into();
 
@@ -579,6 +637,10 @@ impl Store {
             let mut request = blob_client.get();
             if let Some(lease_id) = lease_id.as_ref() {
                 request = request.lease_id(*lease_id);
+            }
+
+            if let Some(snapshot) = snapshot.as_ref() {
+                request = request.blob_versioning(snapshot.clone());
             }
 
             let mut stream = request.range(range).into_stream();
@@ -613,6 +675,7 @@ impl Default for Store {
             last_fetched: None,
             container_client: None,
             lease_id: None,
+            snapshot: None,
         }
     }
 }
