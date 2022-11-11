@@ -291,6 +291,7 @@ impl Store {
                                 match (name.as_ref(), symbol.as_ref()) {
                                     ("store", "control") => {}
                                     ("store", symbol) => {
+                                        current_encoder.take();
                                         if let Some((id, Some(encoder))) =
                                             self.reverse_index.get(symbol).and_then(|id| {
                                                 Some((
