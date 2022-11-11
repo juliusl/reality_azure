@@ -117,6 +117,20 @@ impl Store {
         }
     }
 
+    /// Takes an encoder and replaces with an empty encoder,
+    /// 
+    pub fn take_encoder<W>(&mut self) -> Option<Encoder> 
+    where
+        W: WireObject
+    {
+        if let Some(encoder) = self.protocol.take_encoder(W::resource_id()) {
+            self.protocol.ensure_encoder::<W>();
+            Some(encoder)
+        } else {
+            None
+        }
+    }
+
     /// Takes the uploaded store blob data if successfully fetched,
     ///
     pub async fn take(&mut self, prefix: impl AsRef<str>, timeout: Option<Duration>) -> bool {
