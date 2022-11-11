@@ -563,6 +563,8 @@ impl Store {
 
         match request.await {
             Ok(resp) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
                 self.snapshot = Some(resp.snapshot);
             }
             Err(err) => {
