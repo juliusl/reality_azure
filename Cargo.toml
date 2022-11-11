@@ -7,10 +7,15 @@ edition = "2021"
 
 [dependencies]
 
-azure_storage = "0.7.0"
-azure_identity = "0.7.0"
-azure_storage_blobs = "0.7.0"
-azure_core = "0.6.0"
+# azure_storage = "0.7.0"
+# azure_identity = "0.7.0"
+# azure_storage_blobs = "0.7.0"
+# azure_core = "0.6.0"
+azure_storage = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
+azure_identity = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
+azure_storage_blobs = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
+azure_core = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
+
 reality = { git = "https://github.com/juliusl/reality.git", branch="pr/protocol" }
 bytes = "1.2.1"
 tokio = "1.20.1"
