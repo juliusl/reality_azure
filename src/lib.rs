@@ -10,7 +10,7 @@ use azure_storage_blobs::prelude::{
 use bytes::Bytes;
 use futures::{future::try_join_all, StreamExt};
 use reality::{
-    wire::{ControlDevice, Data, Encoder, Frame, Interner, Protocol, ResourceId},
+    wire::{ControlDevice, Data, Frame, Interner, Protocol, ResourceId},
     Keywords,
 };
 use std::{
@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
 
 pub use reality::wire::WireObject;
+pub use reality::wire::Encoder;
 
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
