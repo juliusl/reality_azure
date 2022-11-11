@@ -126,8 +126,11 @@ impl Store {
     where
         W: WireObject
     {
-        if let Some(encoder) = self.protocol.take_encoder(W::resource_id()) {
+        if let Some(mut encoder) = self.protocol.take_encoder(W::resource_id()) {
             self.protocol.ensure_encoder::<W>();
+
+            encoder.frame_index = W::build_index(&encoder.interner, &encoder.frames);
+
             Some(encoder)
         } else {
             None
