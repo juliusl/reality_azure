@@ -152,6 +152,18 @@ impl Store {
         let blob_client = container_client.blob_client(&format!("{}/store", prefix.as_ref()));
         let blob_client = Arc::new(blob_client);
 
+        match blob_client.exists().await {
+            Ok(exists) => {
+                if !exists {
+                    return false;
+                }
+            },
+            Err(err) => {
+                event!(Level::ERROR, "Could not check if blob exists, {err}");
+                return false;
+            },
+        }
+
         let lease = if let Some(timeout) = timeout {
             blob_client.acquire_lease(timeout).await
         } else {
@@ -170,10 +182,17 @@ impl Store {
 
         if self.fetch(prefix).await {
             let lease_id = self.lease_id.take().expect("should have a lease id");
-            match blob_client.delete().lease_id(lease_id).await {
+            match blob_client.blob_lease_client(lease_id).release().await {
                 Ok(_) => {}
                 Err(err) => {
-                    event!(Level::ERROR, "Could not delete blob, {err}");
+                    event!(Level::ERROR, "Could not release lease {err}");
+                }
+            }
+
+            match blob_client.delete().await {
+                Ok(_) => {}
+                Err(err) => {
+                    event!(Level::ERROR, "Could not delete blob {err}");
                 }
             }
 
