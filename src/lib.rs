@@ -387,7 +387,7 @@ impl Store {
         }
     }
 
-    /// Uploading store,
+    /// Uploading store, returns true if upload completed
     ///
     /// # Wire object layout
     ///
@@ -410,7 +410,7 @@ impl Store {
     /// <If there are any extents>  0x0A/0x0D   <extents get their own block>
     ///
     ///
-    pub async fn upload(&self, prefix: impl AsRef<str>) {
+    pub async fn upload(&self, prefix: impl AsRef<str>) -> bool {
         let container_client = self
             .container_client
             .as_ref()
@@ -517,6 +517,7 @@ impl Store {
             Ok(_) => {}
             Err(err) => {
                 event!(Level::ERROR, "Could not upload store objects, {err}");
+                return false;
             }
         }
 
@@ -532,9 +533,10 @@ impl Store {
             request = request.lease_id(lease_id)
         }
         match request.await {
-            Ok(_) => {}
+            Ok(_) => true,
             Err(err) => {
                 event!(Level::ERROR, "Could not put block list, {err}");
+                false
             }
         }
     }
