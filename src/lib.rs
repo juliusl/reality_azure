@@ -359,20 +359,17 @@ impl Store {
                                             self.snapshot.clone(),
                                         );
 
-                                        match tokio::io::copy(&mut reader, &mut encoder.blob_device)
-                                            .await
-                                        {
-                                            Ok(copied) => {
-                                                assert_eq!(copied, block.size_in_bytes);
-                                                event!(Level::TRACE, "Copied, {copied}");
-                                            }
+                                        match reader.read_to_end(&mut encoder.blob_device.get_mut()).await {
+                                            Ok(read) => {
+                                                if let Some(Data::Extent { length, ..}) = frame.value() {
+                                                    assert_eq!(length as usize, read);
+                                                    event!(Level::TRACE, "Read blob, {length}");
+                                                }
+                                            },
                                             Err(err) => {
-                                                event!(
-                                                    Level::ERROR,
-                                                    "Could not copy bytes into blob device, {err}"
-                                                );
-                                            }
-                                        };
+                                                event!(Level::ERROR, "Could not read blob, {err}");
+                                            },
+                                        }
                                     }
                                 }
                             }
