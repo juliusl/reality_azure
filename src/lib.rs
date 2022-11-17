@@ -18,12 +18,13 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io::Cursor,
     sync::Arc,
-    time::Duration,
+    time::Duration
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
 
 pub use reality::wire::Encoder;
+pub use reality::wire::Decoder;
 pub use reality::wire::WireObject;
 
 /// Struct for uploading/fetching protocol data from azure storage,
@@ -157,11 +158,11 @@ impl Store {
                 if !exists {
                     return false;
                 }
-            },
+            }
             Err(err) => {
                 event!(Level::ERROR, "Could not check if blob exists, {err}");
                 return false;
-            },
+            }
         }
 
         let lease = if let Some(timeout) = timeout {
@@ -565,7 +566,10 @@ impl Store {
 
             if current == etag {
                 // Skip, creating a snapshot if the data would be the same
-                event!(Level::TRACE, "Skip creating a snapshot if the etag is still the same");
+                event!(
+                    Level::TRACE,
+                    "Skip creating a snapshot if the etag is still the same"
+                );
                 self.snapshot = Some(snapshot);
                 return false;
             }
