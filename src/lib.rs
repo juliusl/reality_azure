@@ -9,6 +9,7 @@ use azure_storage_blobs::{
     prelude::{BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient, Snapshot},
 };
 use bytes::Bytes;
+use flate2::{write::GzEncoder, Compression, read::GzDecoder};
 use futures::{future::try_join_all, StreamExt};
 use reality::{
     wire::{ControlDevice, Data, Frame, Interner, Protocol, ResourceId},
@@ -16,7 +17,6 @@ use reality::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::Cursor,
     sync::Arc,
     time::Duration
 };
@@ -440,7 +440,7 @@ impl Store {
                 let encoder_frame = Frame::extension("store", name);
 
                 let mut block_list = VecDeque::default();
-                let mut buffer = Cursor::new(vec![]);
+                let mut buffer = GzEncoder::new(vec![], Compression::fast());
 
                 interner.add_ident(name);
                 interner = interner.merge(&encoder.interner);
@@ -459,9 +459,11 @@ impl Store {
                             let end = start + length as usize;
                             let block_id = Bytes::copy_from_slice(frame.bytes());
 
+                            let encoder = GzEncoder::new(encoder.blob_device.get_ref()[start..end].to_vec(), Compression::fast());
+
                             let mut task = blob_client.put_block(
                                 block_id.clone(),
-                                Bytes::copy_from_slice(&encoder.blob_device.get_ref()[start..end]),
+                                Bytes::from(encoder.finish().expect("should be able to compress")),
                             );
                             if let Some(lease_id) = self.lease_id.as_ref() {
                                 task = task.lease_id(*lease_id);
@@ -482,7 +484,7 @@ impl Store {
                 // Prepend the object's store frame to the block list and upload it's frames
                 let block_id = Bytes::copy_from_slice(encoder_frame.bytes());
                 let mut upload =
-                    blob_client.put_block(block_id.clone(), Bytes::from(buffer.into_inner()));
+                    blob_client.put_block(block_id.clone(), Bytes::from(buffer.finish().expect("should be able to complete")));
                 if let Some(lease_id) = self.lease_id.as_ref() {
                     upload = upload.lease_id(*lease_id);
                 }
@@ -496,7 +498,7 @@ impl Store {
         // Handle control_device
         let control_device = ControlDevice::new(interner);
         let control_frame = Frame::extension("store", "control");
-        let mut buffer = Cursor::new(vec![]);
+        let mut buffer = GzEncoder::new(vec![], Compression::fast());
         for d in control_device.data {
             std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
@@ -507,7 +509,7 @@ impl Store {
             std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
         }
         let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
-        let mut upload = blob_client.put_block(control_block_id.clone(), buffer.into_inner());
+        let mut upload = blob_client.put_block(control_block_id.clone(), buffer.finish().expect("should be able to compress"));
         if let Some(lease_id) = self.lease_id {
             upload = upload.lease_id(lease_id)
         }
@@ -687,7 +689,8 @@ impl Store {
                 match resp {
                     Ok(r) => {
                         let reader = r.data.collect().await.expect("should be able to read");
-                        match writer.write_all(reader.as_ref()).await {
+                        let reader = GzDecoder::new(reader.as_ref());
+                        match writer.write_all(reader.get_ref()).await {
                             Ok(_) => {}
                             Err(err) => {
                                 event!(Level::ERROR, "Could not write bytes {err}");
