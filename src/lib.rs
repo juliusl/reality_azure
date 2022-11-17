@@ -437,7 +437,8 @@ impl Store {
                    - Any extent frames in the stored wire object are replicated and added after the object block
                    <Block with frames>         0x0E        store           <object_name>
                 */
-                let encoder_frame = Frame::extension("store", name);
+                let mut extension_encoder = Encoder::default();
+                let mut extension = extension_encoder.start_extension("store", name);
 
                 let mut block_list = VecDeque::default();
                 let mut buffer = GzEncoder::new(vec![], Compression::fast());
@@ -470,6 +471,8 @@ impl Store {
                             }
                             upload_block_futures.push(task.into_future());
                             block_list.push_back(BlobBlockType::new_uncommitted(block_id));
+
+                            extension.as_mut().frames.push(frame.clone());
                         }
                     }
 
@@ -480,6 +483,11 @@ impl Store {
                         }
                     }
                 }
+
+                let pos = extension.insert_at();
+                drop(extension);
+
+                let encoder_frame = &extension_encoder.frames[pos];
 
                 // Prepend the object's store frame to the block list and upload it's frames
                 let block_id = Bytes::copy_from_slice(encoder_frame.bytes());
