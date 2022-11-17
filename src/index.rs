@@ -33,7 +33,7 @@ pub struct StoreIndex {
 
 /// Struct for a store key,
 ///
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct StoreKey {
     /// Name key,
     ///
@@ -171,7 +171,7 @@ impl<'a> Entry<'a> {
         self.key().symbol(self.interner)
     }
 
-    /// Pulls bytes for this entry,
+    /// Returns a reader to pull bytes for this entry,
     ///
     pub async fn pull(&self) -> DuplexStream {
         Store::pull_byte_range(
