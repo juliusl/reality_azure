@@ -18,7 +18,7 @@ use reality::{
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
-    time::Duration
+    time::Duration, io::Read
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
@@ -690,9 +690,20 @@ impl Store {
                     Ok(r) => {
                         let reader = r.data.collect().await.expect("should be able to read");
                         let mut reader = GzDecoder::new(reader.as_ref());
-                        match  tokio::io::copy(reader.get_mut(), &mut writer).await{
+                        let mut buffer = vec![];
+                        
+                        match reader.read_to_end(&mut buffer) {
                             Ok(read) => {
-                                event!(Level::TRACE, "{read} bytes fetched");
+                                event!(Level::TRACE, "Decoded {read} bytes");
+                            },
+                            Err(err) => {
+                                event!(Level::ERROR, "Could not decode bytes, {err}");
+                            },
+                        }
+
+                        match  writer.write_all(buffer.as_slice()).await {
+                            Ok(_) => {
+                                
                             }
                             Err(err) => {
                                 event!(Level::ERROR, "Could not write bytes {err}");
