@@ -27,6 +27,9 @@ pub use reality::wire::Encoder;
 pub use reality::wire::Decoder;
 pub use reality::wire::WireObject;
 
+mod index;
+pub use index::StoreIndex;
+
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
 pub struct Store {
@@ -669,7 +672,7 @@ impl Store {
 
     /// Returns the other end of a duplex stream to read bytes from,
     ///
-    fn pull_byte_range(
+    pub fn pull_byte_range(
         blob_client: Arc<BlobClient>,
         range: impl Into<Range>,
         lease_id: Option<LeaseId>,
