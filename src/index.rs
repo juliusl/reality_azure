@@ -1,7 +1,10 @@
-use azure_storage_blobs::{prelude::{BlobClient, Snapshot}, blob::{BlockWithSizeList, BlobBlockWithSize}};
-use std::{collections::HashMap, ops::Range, sync::Arc};
 use azure_core::request_options::LeaseId;
+use azure_storage_blobs::{
+    blob::{BlobBlockWithSize, BlockWithSizeList},
+    prelude::{BlobClient, Snapshot},
+};
 use reality::wire::{Frame, Interner};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 use tokio::io::DuplexStream;
 
 use crate::Store;
@@ -50,7 +53,7 @@ pub struct Entry<'a> {
     ///
     store_key: StoreKey,
     /// Interner,
-    /// 
+    ///
     interner: &'a Interner,
     /// Start byte range,
     ///
@@ -68,11 +71,16 @@ impl StoreIndex {
         lease_id: Option<LeaseId>,
         snapshot_id: Option<Snapshot>,
     ) -> Self {
+        let mut interner = Interner::default();
+        interner.add_ident("store");
+        interner.add_ident("control");
+        interner.add_ident("");
+
         let index = StoreIndex {
             blob_client,
             snapshot_id,
             lease_id,
-            interner: Interner::default(),
+            interner,
             map: HashMap::default(),
         };
 
@@ -80,14 +88,23 @@ impl StoreIndex {
     }
 
     /// Index a block list,
-    /// 
-    pub fn index(&mut self, interner: &Interner, block_list: BlockWithSizeList) {
-        self.interner = self.interner.merge(interner);
+    ///
+    pub async fn index(&mut self, block_list: BlockWithSizeList) {
         let mut offset = 0;
         for block in block_list.blocks {
             self.add_entry(offset, &block);
             offset += block.size_in_bytes as usize;
         }
+
+        let mut interner = Interner::default();
+        if let Some(entry) = self.entries().find(|e| {
+            e.name() == Some(&String::from("store")) && e.symbol() == Some(&String::from("control"))
+        }) {
+            let _interner = Store::load_interner(entry.pull().await).await;
+            interner = self.interner.merge(&_interner);
+        }
+
+        self.interner = interner;
     }
 
     /// Returns entries,
@@ -104,7 +121,7 @@ impl StoreIndex {
 
     /// Adds an entry to the store index,
     ///
-    fn add_entry(&mut self, offset: usize, block: &BlobBlockWithSize)  {
+    fn add_entry(&mut self, offset: usize, block: &BlobBlockWithSize) {
         match &block.block_list_type {
             azure_storage_blobs::prelude::BlobBlockType::Committed(block_id) => {
                 let frame = Frame::from(block_id.as_ref());
@@ -113,8 +130,9 @@ impl StoreIndex {
                     symbol: frame.symbol_key(),
                 };
 
-                self.map.insert(key, offset..(block.size_in_bytes as usize) + offset);
-            },
+                self.map
+                    .insert(key, offset..(block.size_in_bytes as usize) + offset);
+            }
             _ => {}
         }
     }
@@ -142,13 +160,13 @@ impl<'a> Entry<'a> {
     }
 
     /// Returns the name of this entry,
-    /// 
+    ///
     pub fn name(&self) -> Option<&String> {
         self.key().name(self.interner)
     }
 
     /// Returns the symbol of this entry,
-    /// 
+    ///
     pub fn symbol(&self) -> Option<&String> {
         self.key().symbol(self.interner)
     }
