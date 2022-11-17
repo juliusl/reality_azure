@@ -689,9 +689,11 @@ impl Store {
                 match resp {
                     Ok(r) => {
                         let reader = r.data.collect().await.expect("should be able to read");
-                        let reader = GzDecoder::new(reader.as_ref());
-                        match writer.write_all(reader.get_ref()).await {
-                            Ok(_) => {}
+                        let mut reader = GzDecoder::new(reader.as_ref());
+                        match  tokio::io::copy(reader.get_mut(), &mut writer).await{
+                            Ok(read) => {
+                                event!(Level::TRACE, "{read} bytes fetched");
+                            }
                             Err(err) => {
                                 event!(Level::ERROR, "Could not write bytes {err}");
                             }
