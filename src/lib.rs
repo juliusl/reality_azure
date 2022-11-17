@@ -17,7 +17,7 @@ use reality::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::Read,
+    io::{Read, Write},
     sync::Arc,
     time::Duration,
 };
@@ -359,16 +359,21 @@ impl Store {
                                             self.snapshot.clone(),
                                         );
 
-                                        match reader.read_to_end(&mut encoder.blob_device.get_mut()).await {
+                                        match reader
+                                            .read_to_end(&mut encoder.blob_device.get_mut())
+                                            .await
+                                        {
                                             Ok(read) => {
-                                                if let Some(Data::Extent { length, ..}) = frame.value() {
+                                                if let Some(Data::Extent { length, .. }) =
+                                                    frame.value()
+                                                {
                                                     assert_eq!(length as usize, read);
                                                     event!(Level::TRACE, "Read blob, {length}");
                                                 }
-                                            },
+                                            }
                                             Err(err) => {
                                                 event!(Level::ERROR, "Could not read blob, {err}");
-                                            },
+                                            }
                                         }
                                     }
                                 }
@@ -461,14 +466,22 @@ impl Store {
                             let end = start + length as usize;
                             let block_id = Bytes::copy_from_slice(frame.bytes());
 
-                            let encoder = GzEncoder::new(
-                                encoder.blob_device.get_ref()[start..end].to_vec(),
-                                Compression::fast(),
-                            );
+                            let mut gz_encoder = GzEncoder::new(vec![], Compression::fast());
+
+                            match gz_encoder.write_all(&encoder.blob_device.get_ref()[start..end]) {
+                                Ok(_) => {
+                                    
+                                },
+                                Err(err) => {
+                                    event!(Level::ERROR, "Error wrting to gz encoder, {err}");
+                                },
+                            }
 
                             let mut task = blob_client.put_block(
                                 block_id.clone(),
-                                Bytes::from(encoder.finish().expect("should be able to compress")),
+                                Bytes::from(
+                                    gz_encoder.finish().expect("should be able to compress"),
+                                ),
                             );
                             if let Some(lease_id) = self.lease_id.as_ref() {
                                 task = task.lease_id(*lease_id);
@@ -642,22 +655,23 @@ impl Store {
         let blob_client = Arc::new(blob_client);
 
         if let Some(block_list) = self.block_list(blob_client.clone()).await {
-
             let mut index = StoreIndex::empty(blob_client, self.lease_id, self.snapshot.clone());
 
             index.index(block_list).await;
 
             Some(index)
         } else {
-            None 
+            None
         }
     }
 }
 
 impl Store {
     /// Returns an interner after parsing control device frames,
-    /// 
-    pub async fn load_interner(mut reader: impl AsyncReadExt + tokio::io::AsyncRead + Unpin) -> Interner {
+    ///
+    pub async fn load_interner(
+        mut reader: impl AsyncReadExt + tokio::io::AsyncRead + Unpin,
+    ) -> Interner {
         let mut control_device = ControlDevice::default();
 
         let mut buffer = [0; 64];
