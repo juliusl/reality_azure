@@ -4,11 +4,7 @@ use azure_storage_blobs::{
     prelude::{BlobClient, Snapshot},
 };
 use reality::wire::{Decoder, Encoder, Frame, Interner};
-use std::{
-    collections::HashMap,
-    ops::Range,
-    sync::Arc,
-};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, DuplexStream};
 use tokio_tar::{Archive, Header};
 use tracing::{event, Level};
@@ -43,7 +39,7 @@ pub struct StoreIndex {
 
 /// Struct for a store key,
 ///
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct StoreKey {
     /// Name key,
     ///
@@ -98,7 +94,7 @@ impl StoreIndex {
         index
     }
 
-    /// Index a block list, returns an encoder that represents the frames from the block list,
+    /// Index a block list,
     ///
     pub async fn index(&mut self, block_list: BlockWithSizeList) {
         let mut offset = 0;
@@ -155,7 +151,7 @@ impl StoreIndex {
     }
 
     /// Returns an entry for a key,
-    /// 
+    ///
     pub fn entry(&self, key: StoreKey) -> Option<Entry> {
         let index = self.clone();
         let index = Arc::new(index);
@@ -171,7 +167,7 @@ impl StoreIndex {
                 end: range.end,
             })
         } else {
-            None 
+            None
         }
     }
 
@@ -295,36 +291,38 @@ impl Entry {
     /// Returns true if this entry has a blob device,
     ///
     pub fn has_blob_device(&self) -> bool {
-        if let Some(symbol) = self.symbol() {
-            self.index.blob_device_map.contains_key(symbol)
+        if let Some(keys) = self
+            .symbol()
+            .and_then(|s| self.index.blob_device_map.get(s))
+        {
+            !keys.is_empty()
         } else {
             false
         }
     }
 
     /// Returns a fully loaded encoder for this entry,
-    /// 
+    ///
     pub async fn encoder(&self) -> Option<Encoder> {
         if let Some(blocks) = self
             .symbol()
             .and_then(|s| self.index.blob_device_map.get(s))
         {
             let mut encoder = Encoder::default();
-        
+
             for b in blocks.iter().filter_map(|b| self.index.entry(*b)) {
                 let mut stream = b.pull().await;
 
                 match stream.read_to_end(encoder.blob_device.get_mut()).await {
-                    Ok(_) => {
-                    },
+                    Ok(_) => {}
                     Err(err) => {
                         event!(Level::ERROR, "Error reading bytes for blob device, {err}");
-                    },
+                    }
                 }
             }
 
             encoder.interner = self.index.interner.clone();
-            
+
             let mut frames = self.pull().await;
 
             let mut buffer = [0; 64];
@@ -333,9 +331,22 @@ impl Entry {
                 encoder.frames.push(Frame::from(buffer));
             }
 
-           Some(encoder)
+            Some(encoder)
         } else {
             None
         }
+    }
+
+    /// Return blob device entries that belong to this entry,
+    ///
+    pub fn iter_blob_entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        let keys = if self.has_blob_device() {
+            let key = self.symbol().expect("should have a symbol");
+            self.index.blob_device_map.get(key).expect("should have keys").clone()
+        } else {
+            vec![]
+        };
+
+        keys.into_iter().filter_map(|k| self.index.entry(k))
     }
 }
