@@ -58,6 +58,9 @@ pub struct Store {
     /// Current snapshot,
     ///
     snapshot: Option<Snapshot>,
+    /// Store name, defaults to "store"
+    /// 
+    store_name: &'static str,
 }
 
 impl Store {
@@ -157,7 +160,7 @@ impl Store {
             .as_ref()
             .clone()
             .expect("should be authenticated to commit the store");
-        let blob_client = container_client.blob_client(&format!("{}/store", prefix.as_ref()));
+        let blob_client = container_client.blob_client(&format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         match blob_client.exists().await {
@@ -225,7 +228,7 @@ impl Store {
             .as_ref()
             .clone()
             .expect("should be authenticated to commit the store");
-        let prefix = format!("{}/store", prefix.as_ref());
+        let prefix = format!("{}/{}", prefix.as_ref(), self.store_name);
         let blob_client = container_client.blob_client(prefix);
         let blob_client = Arc::new(blob_client);
 
@@ -427,7 +430,7 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
+        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
 
         let mut interner = Interner::default();
 
@@ -591,7 +594,7 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
+        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         let etag = self.etag(blob_client.clone()).await;
@@ -654,7 +657,7 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/store", prefix.as_ref()));
+        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         if let Some(block_list) = self.block_list(blob_client.clone()).await {
@@ -815,6 +818,7 @@ impl Default for Store {
             container_client: None,
             lease_id: None,
             snapshot: None,
+            store_name: "store",
         }
     }
 }
