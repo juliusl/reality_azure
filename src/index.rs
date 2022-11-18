@@ -19,6 +19,7 @@ use crate::Store;
 ///
 /// Indexes all interned content,
 ///
+#[derive(Clone)]
 pub struct StoreIndex {
     /// Interner for decoding string references,
     ///
@@ -54,16 +55,16 @@ pub struct StoreKey {
 
 /// Struct for an entry in the index,
 ///
-pub struct Entry<'a> {
+pub struct Entry {
     /// Parent index of this entry,
     ///
-    index: &'a StoreIndex,
+    index: Arc<StoreIndex>,
     /// Store key of this entry,
     ///
     store_key: StoreKey,
     /// Interner,
     ///
-    interner: &'a Interner,
+    interner: Arc<Interner>,
     /// Start byte range,
     ///
     start: usize,
@@ -139,11 +140,15 @@ impl StoreIndex {
 
     /// Returns entries,
     ///
-    pub fn entries(&self) -> impl Iterator<Item = Entry> {
-        self.map.iter().map(|(key, range)| Entry {
-            index: self,
+    pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        let index = self.clone();
+        let index = Arc::new(index);
+        let interner = self.interner.clone();
+        let interner = Arc::new(interner);
+        self.map.iter().map(move |(key, range)| Entry {
+            index: index.clone(),
             store_key: *key,
-            interner: &self.interner,
+            interner: interner.clone(),
             start: range.start,
             end: range.end,
         })
@@ -152,11 +157,16 @@ impl StoreIndex {
     /// Returns an entry for a key,
     /// 
     pub fn entry(&self, key: StoreKey) -> Option<Entry> {
+        let index = self.clone();
+        let index = Arc::new(index);
+        let interner = self.interner.clone();
+        let interner = Arc::new(interner);
+
         if let Some(range) = self.map.get(&key) {
             Some(Entry {
-                index: self,
+                index: index,
                 store_key: key,
-                interner: &self.interner,
+                interner: interner,
                 start: range.start,
                 end: range.end,
             })
@@ -200,7 +210,7 @@ impl StoreKey {
     }
 }
 
-impl<'a> Entry<'a> {
+impl Entry {
     /// Returns the name of the entry,
     ///
     pub fn key(&self) -> &StoreKey {
@@ -210,13 +220,13 @@ impl<'a> Entry<'a> {
     /// Returns the name of this entry,
     ///
     pub fn name(&self) -> Option<&String> {
-        self.key().name(self.interner)
+        self.key().name(&self.interner)
     }
 
     /// Returns the symbol of this entry,
     ///
     pub fn symbol(&self) -> Option<&String> {
-        self.key().symbol(self.interner)
+        self.key().symbol(&self.interner)
     }
 
     /// Returns a reader to pull bytes for this entry,
