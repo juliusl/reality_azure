@@ -110,16 +110,34 @@ impl Store {
     }
 
     /// Registers a wire object w/ the store,
+    /// 
+    /// Ensures the wire object has an encoder,
     ///
     pub fn register<W>(&mut self, name: impl AsRef<str>)
     where
         W: WireObject,
     {
-        self.index
-            .insert(W::resource_id(), name.as_ref().to_string());
-        self.reverse_index
-            .insert(name.as_ref().to_string(), W::resource_id());
+        self.register_with(W::resource_id(), name);
         self.protocol.ensure_encoder::<W>();
+    }
+
+    /// Registers a resource id w/ the store,
+    ///
+    pub fn register_with(&mut self, resource_id: ResourceId, name: impl AsRef<str>) {
+        self.index
+            .insert(resource_id.clone(), name.as_ref().to_string());
+        self.reverse_index
+            .insert(name.as_ref().to_string(), resource_id.clone());
+        
+        self.set_encoder(resource_id.clone(), Encoder::default());
+    }
+
+    /// Sets the encoder for resource id, the id must be registered,
+    /// 
+    pub fn set_encoder(&mut self, resource_id: ResourceId, encoder: Encoder) {
+        if self.index.contains_key(&resource_id) {
+            self.protocol.set_encoder(resource_id, encoder);
+        }
     }
 
     /// Returns an encoder for a wire object,
@@ -150,6 +168,12 @@ impl Store {
         } else {
             None
         }
+    }
+
+    /// Takes an encoder by id,
+    /// 
+    pub fn take_encoder_by_id(&mut self, resource_id: ResourceId) -> Option<Encoder> {
+        self.protocol.take_encoder(resource_id) 
     }
 
     /// Takes the uploaded store blob data if successfully fetched,

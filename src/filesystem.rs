@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write};
 
-use reality::wire::{Decoder, Encoder, FrameIndex, ResourceId, WireObject};
+use reality::wire::{Decoder, Encoder};
 use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder};
@@ -9,7 +9,7 @@ use tracing::{event, Level};
 /// Struct for encoding/decoding a filesystem to/from the store,
 ///
 /// A TAR is used to represent and encode the filesystem contents.
-/// 
+///
 pub struct Filesystem {
     /// Root archive with the filesystem,
     ///
@@ -25,7 +25,7 @@ impl Filesystem {
             Err(_) => None,
         }
     }
-    
+
     /// Returns a new filesystem from a builder
     ///
     pub async fn new(mut builder: Builder<Vec<u8>>) -> Option<Self> {
@@ -38,6 +38,12 @@ impl Filesystem {
                 None
             }
         }
+    }
+
+    /// Returns an empty filesystem,4
+    /// 
+    pub fn empty() -> Self {
+        Self { builder: None }
     }
 
     /// Exports the filesystem as an encoder,
@@ -111,7 +117,7 @@ impl Filesystem {
                     if let Some(bin) = value.binary() {
                         let mut archive = Archive::new(bin.as_slice());
                         let mut entries = archive.entries().unwrap();
-        
+
                         if let Some(entry) = entries.next().await {
                             let entry = entry.unwrap();
                             match builder
@@ -125,7 +131,7 @@ impl Filesystem {
                             }
                         }
                     }
-                },
+                }
                 _ => {}
             }
         }
@@ -157,21 +163,19 @@ impl Filesystem {
     }
 
     /// Unpack an archive to the specified destination,
-    /// 
+    ///
     pub async fn unpack(&mut self, path: impl AsRef<str>) {
         if let Some(builder) = self.builder.take() {
             match builder.into_inner().await {
                 Ok(data) => {
                     let mut archive = Archive::new(data.as_slice());
                     match archive.unpack(path.as_ref()).await {
-                        Ok(_) => {
-                            
-                        },
+                        Ok(_) => {}
                         Err(err) => {
                             event!(Level::ERROR, "Could not unpack, {err}");
-                        },
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     event!(Level::ERROR, "could not take builder, {err}");
                 }
