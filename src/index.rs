@@ -4,8 +4,10 @@ use azure_storage_blobs::{
     prelude::{BlobClient, Snapshot},
 };
 use reality::wire::{Frame, Interner};
+use tokio_tar::{Archive, Header};
+use tracing::{event, Level};
 use std::{collections::HashMap, ops::Range, sync::Arc};
-use tokio::io::DuplexStream;
+use tokio::io::{DuplexStream, AsyncReadExt};
 
 use crate::Store;
 
@@ -180,5 +182,59 @@ impl<'a> Entry<'a> {
             self.index.lease_id,
             self.index.snapshot_id.clone(),
         )
+    }
+
+    /// If name is "tar", unpacks this as a file to path,
+    /// 
+    pub async fn unpack(&self, path: impl AsRef<str>) {
+        if self.name() == Some(&String::from("tar")) {
+            let mut bytes = self.pull().await;
+
+            let mut buf = vec![];
+
+            match bytes.read_to_end(&mut buf).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes");
+                },
+                Err(err) => {
+                    event!(Level::ERROR, "Could not read blob, {err}");
+                },
+            }
+
+            match Archive::new(buf.as_slice()).unpack(path.as_ref()).await {
+                Ok(_) => {
+                    
+                },
+                Err(err) => {
+                    event!(Level::ERROR, "Could not unpack as archive, {err}");
+                },
+            }
+        } else {
+            event!(Level::WARN, "Tried to unpack an entry that is not a tar");
+        }
+    }
+
+    /// Returns a file header if name is "tar",
+    /// 
+    pub async fn file_header(&self) -> Option<Header> {
+        if self.name() == Some(&String::from("tar")) {
+            let mut bytes = self.pull().await;
+
+            let mut buf = vec![0; 512];
+
+            match bytes.read_exact(&mut buf).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes");
+                },
+                Err(err) => {
+                    event!(Level::ERROR, "Could not read blob, {err}");
+                },
+            }
+
+            Some(Header::from_byte_slice(buf.as_slice()).clone())
+        } else {
+            event!(Level::WARN, "Tried to unpack an entry that is not a tar");
+            None
+        }
     }
 }

@@ -69,7 +69,7 @@ impl Filesystem {
 
                                 match entry.read_to_end(&mut buf).await {
                                     Ok(_) => {
-                                        encoder.add_binary(path, buf);
+                                        encoder.define_binary("tar", path, buf);
                                     }
                                     Err(err) => {
                                         event!(Level::ERROR, "Could not read entry {err}");
@@ -103,23 +103,30 @@ impl Filesystem {
     {
         let mut builder = Builder::new(vec![]);
 
-        for (name, value) in decoder.decode_values() {
-            if let Some(bin) = value.binary() {
-                let mut archive = Archive::new(bin.as_slice());
-                let mut entries = archive.entries().unwrap();
+        let files = decoder.decode_properties("tar");
 
-                if let Some(entry) = entries.next().await {
-                    let entry = entry.unwrap();
-                    match builder
-                        .append_data(&mut entry.header().clone(), name, entry)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(err) => {
-                            event!(Level::ERROR, "Error writing tar entry, {err}");
+        for (name, value) in files.iter_properties() {
+            match value {
+                reality::BlockProperty::Single(value) => {
+                    if let Some(bin) = value.binary() {
+                        let mut archive = Archive::new(bin.as_slice());
+                        let mut entries = archive.entries().unwrap();
+        
+                        if let Some(entry) = entries.next().await {
+                            let entry = entry.unwrap();
+                            match builder
+                                .append_data(&mut entry.header().clone(), name, entry)
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    event!(Level::ERROR, "Error writing tar entry, {err}");
+                                }
+                            }
                         }
                     }
-                }
+                },
+                _ => {}
             }
         }
 
