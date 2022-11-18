@@ -31,6 +31,9 @@ pub use reality::wire::WireObject;
 mod index;
 pub use index::StoreIndex;
 
+mod filesystem;
+pub use filesystem::Filesystem;
+
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
 pub struct Store {
