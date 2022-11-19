@@ -40,7 +40,7 @@ pub struct StoreIndex {
 
 /// Struct for a store key,
 ///
-#[derive(Default, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub struct StoreKey {
     /// Name key,
     ///
@@ -48,6 +48,9 @@ pub struct StoreKey {
     /// Symbol key,
     ///
     symbol: u64,
+    /// Original frame,
+    /// 
+    frame: Frame,
 }
 
 /// Struct for an entry in the index,
@@ -131,6 +134,7 @@ impl StoreIndex {
                 keys.push(StoreKey {
                     name: frame.name_key(),
                     symbol: frame.symbol_key(),
+                    frame: frame.clone(),
                 });
             }
 
@@ -147,7 +151,7 @@ impl StoreIndex {
         let interner = Arc::new(interner);
         self.map.iter().map(move |(key, range)| Entry {
             index: index.clone(),
-            store_key: *key,
+            store_key: key.clone(),
             interner: interner.clone(),
             start: range.start,
             end: range.end,
@@ -167,7 +171,7 @@ impl StoreIndex {
             .iter()
             .map(move |(key, range)| Entry {
                 index: index.clone(),
-                store_key: *key,
+                store_key: key.clone(),
                 interner: interner.clone(),
                 start: range.start,
                 end: range.end,
@@ -211,6 +215,7 @@ impl StoreIndex {
                 let key = StoreKey {
                     name: frame.name_key(),
                     symbol: frame.symbol_key(),
+                    frame: frame.clone(),
                 };
 
                 self.map
@@ -343,7 +348,7 @@ impl Entry {
         {
             let mut encoder = Encoder::new();
 
-            for b in blocks.iter().filter_map(|b| self.index.entry(*b)) {
+            for b in blocks.iter().filter_map(|b| self.index.entry(b.clone())) {
                 let mut stream = b.pull();
 
                 match stream.read_to_end(encoder.blob_device.get_mut()).await {

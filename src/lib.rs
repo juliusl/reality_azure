@@ -520,7 +520,6 @@ impl Store {
                             */
                             let start = cursor as usize;
                             let end = start + length as usize;
-                            let block_id = Bytes::copy_from_slice(frame.bytes());
 
                             let mut gz_encoder = GzEncoder::new(vec![], Compression::fast());
 
@@ -532,7 +531,7 @@ impl Store {
                             }
 
                             let mut task = blob_client.put_block(
-                                block_id.clone(),
+                                frame.bytes(),
                                 Bytes::from(
                                     gz_encoder.finish().expect("should be able to compress"),
                                 ),
@@ -541,13 +540,13 @@ impl Store {
                                 task = task.lease_id(*lease_id);
                             }
                             upload_block_futures.push(task.into_future());
-                            block_list.push_back(BlobBlockType::new_uncommitted(block_id));
+                            block_list.push_back(BlobBlockType::new_uncommitted(frame.bytes()));
 
                             extension.as_mut().frames.push(frame.clone());
                         }
                     }
 
-                    match std::io::Write::write_all(&mut buffer, frame.bytes()) {
+                    match std::io::Write::write_all(&mut buffer, frame.bytes().as_ref()) {
                         Ok(_) => {}
                         Err(err) => {
                             event!(Level::ERROR, "Could not write to buffer, {err}");
@@ -561,16 +560,15 @@ impl Store {
                 let encoder_frame = &extension_encoder.frames[pos];
 
                 // Prepend the object's store frame to the block list and upload it's frames
-                let block_id = Bytes::copy_from_slice(encoder_frame.bytes());
                 let mut upload = blob_client.put_block(
-                    block_id.clone(),
+                    encoder_frame.bytes(),
                     Bytes::from(buffer.finish().expect("should be able to complete")),
                 );
                 if let Some(lease_id) = self.lease_id.as_ref() {
                     upload = upload.lease_id(*lease_id);
                 }
                 upload_block_futures.push(upload.into_future());
-                block_list.push_front(BlobBlockType::new_uncommitted(block_id));
+                block_list.push_front(BlobBlockType::new_uncommitted(encoder_frame.bytes()));
 
                 objects.push(block_list.make_contiguous().to_vec());
             }
@@ -766,24 +764,23 @@ impl Store {
         let control_frame = Frame::extension("store", "control");
         let mut buffer = GzEncoder::new(vec![], Compression::fast());
         for d in control_device.data {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
         }
         for d in control_device.read {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
         }
         for d in control_device.index {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
         }
-        let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
         let mut upload = blob_client.put_block(
-            control_block_id.clone(),
+            control_frame.bytes(),
             buffer.finish().expect("should be able to compress"),
         );
         if let Some(lease_id) = self.lease_id {
             upload = upload.lease_id(lease_id)
         }
 
-        (upload.into_future(), BlobBlockType::new_uncommitted(control_block_id))
+        (upload.into_future(), BlobBlockType::new_uncommitted(control_frame.bytes()))
     }
 
     /// Returns the current block list,

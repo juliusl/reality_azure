@@ -152,17 +152,15 @@ impl<'a> StoreStream<'a> {
                 }
 
                 if let Some(blob) = blob.take() {
-                    let block_id = Bytes::copy_from_slice(frame.bytes());
-
                     let put_block_request =
-                        blob_client.put_block(block_id.clone(), blob.compress());
+                        blob_client.put_block(frame.bytes(), blob.compress());
 
                     upload_block_futures.push(put_block_request.into_future());
 
                     if let Some(StreamState { block_list, .. }) =
                         stream_states.get_mut(&resource_id)
                     {
-                        block_list.push_back(BlobBlockType::new_uncommitted(block_id));
+                        block_list.push_back(BlobBlockType::new_uncommitted(frame.bytes()));
                     }
                 }
 
@@ -195,7 +193,7 @@ impl<'a> StoreStream<'a> {
             let mut extension = extension_encoder.start_extension("store", name);
 
             for frame in frames.drain(..) {
-                match buffer.write_all(frame.bytes()) {
+                match buffer.write_all(frame.bytes().as_ref()) {
                     Ok(_) => {
                         extension.as_mut().frames.push(frame);
                     }
@@ -209,7 +207,7 @@ impl<'a> StoreStream<'a> {
             drop(extension);
             let encoder_frame = &extension_encoder.frames[pos];
             // Prepend the object's store frame to the block list and upload it's frames
-            let block_id = Bytes::copy_from_slice(encoder_frame.bytes());
+            let block_id = Bytes::copy_from_slice(encoder_frame.bytes().as_ref());
             let upload = blob_client.put_block(
                 block_id.clone(),
                 Bytes::from(buffer.finish().expect("should be able to complete")),
