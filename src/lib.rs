@@ -615,7 +615,7 @@ impl Store {
     /// 
     /// Returns a StoreStream which can be configured by calling .start(), and passing in a select fn,
     ///
-    pub fn start_stream(&mut self, prefix: impl AsRef<str>) -> StoreStream {
+    pub fn create_stream(&mut self, prefix: impl AsRef<str>) -> StoreStream {
         StoreStream::new(self, prefix)
     }
 

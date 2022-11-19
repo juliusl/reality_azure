@@ -1,10 +1,17 @@
-use std::io::{Cursor, Read, Seek, Write};
+use std::{
+    io::{Cursor, Read, Seek, Write},
+    pin::Pin, path::PathBuf,
+};
 
+use bytes::Bytes;
 use reality::{
     wire::{Decoder, Encoder, Frame, Interner},
     Value,
 };
-use tokio::io::AsyncReadExt;
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, DuplexStream},
+};
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder};
 use tracing::{event, Level};
@@ -16,39 +23,49 @@ use crate::{Blob, Streamer};
 /// A TAR is used to represent and encode the filesystem contents.
 ///
 pub struct Filesystem {
-    /// Root archive with the filesystem,
+    /// Root archive source,
     ///
-    builder: Option<Builder<Vec<u8>>>,
+    archive: Option<ArchiveSource>,
 }
 
 impl Filesystem {
     /// Load archive from the filesystem,
     ///
     pub async fn load_tar(path: impl AsRef<str>) -> Option<Self> {
-        match tokio::fs::read(path.as_ref()).await {
-            Ok(stream) => Self::new(Builder::new(stream)).await,
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(path.as_ref())
+            .await
+        {
+            Ok(stream) => Some(Self {
+                archive: Some(ArchiveSource::File(stream)),
+            }),
             Err(_) => None,
         }
     }
 
-    /// Returns a new filesystem from a builder
+    /// Returns filesystem from a streamed tar file,
     ///
-    pub async fn new(mut builder: Builder<Vec<u8>>) -> Option<Self> {
-        match builder.finish().await {
-            Ok(_) => Some(Self {
-                builder: Some(builder),
-            }),
-            Err(err) => {
-                event!(Level::ERROR, "Could not load archive, {err}");
-                None
-            }
+    pub fn stream_tar(stream: DuplexStream) -> Self {
+        Self {
+            archive: Some(ArchiveSource::Stream(stream)),
         }
     }
 
     /// Returns an empty filesystem,
     ///
     pub fn empty() -> Self {
-        Self { builder: None }
+        Self { archive: None }
+    }
+
+    /// Consumes and returns the archive from archive source,
+    ///
+    pub fn take(&mut self) -> Option<Archive<impl AsyncRead + Unpin>> {
+        if let Some(archive) = self.archive.take() {
+            Some(Archive::new(archive))
+        } else {
+            None
+        }
     }
 
     /// Exports the filesystem as an encoder,
@@ -57,14 +74,8 @@ impl Filesystem {
     where
         BlobImpl: Read + Write + Seek + Clone + Default,
     {
-        if let Some(builder) = self.builder.take() {
+        if let Some(mut archive) = self.take() {
             let mut encoder = Encoder::<BlobImpl>::default();
-
-            let archive = builder
-                .into_inner()
-                .await
-                .expect("should be able to take inner stream");
-            let mut archive = Archive::new(archive.as_slice());
 
             match archive.entries() {
                 Ok(mut entries) => {
@@ -112,19 +123,100 @@ impl Filesystem {
         }
     }
 
-    /// Streams this filesystem w/ streamer,
+    /// Imports an archive from a decoder,
+    ///
+    pub async fn import<BlobImpl>(&mut self, decoder: &mut Decoder<'_, BlobImpl>)
+    where
+        BlobImpl: Read + Write + Seek + Clone + Default,
+    {
+        let mut builder = Builder::new(vec![]);
+
+        let files = decoder.decode_properties("tar");
+
+        for (name, value) in files.iter_properties() {
+            match value {
+                reality::BlockProperty::Single(value) => {
+                    if let Some(bin) = value.binary() {
+                        let mut archive = Archive::new(bin.as_slice());
+                        let mut entries = archive.entries().unwrap();
+
+                        if let Some(entry) = entries.next().await {
+                            let entry = entry.unwrap();
+                            match builder
+                                .append_data(&mut entry.header().clone(), name, entry)
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    event!(Level::ERROR, "Error writing tar entry, {err}");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match builder.finish().await {
+            Ok(_) => {
+                let inner = builder
+                    .into_inner()
+                    .await
+                    .expect("should be able to get inner");
+
+                self.archive = Some(ArchiveSource::Memory(inner.into()));
+            }
+            Err(err) => event!(Level::ERROR, "Could not finish building archive, {err}"),
+        }
+    }
+
+    /// Writes the current archive to disk,
+    ///
+    pub async fn write_disk(&mut self, path: impl AsRef<str>) {
+        if let Some(mut builder) = self.take() {
+            let path = PathBuf::from(path.as_ref());
+
+            tokio::fs::create_dir_all(&path).await.expect("should be able to create dirs");
+
+            match tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(path)
+                .await
+            {
+                Ok(mut file) => {
+                    tokio::io::copy(&mut builder, &mut file)
+                        .await
+                        .expect("should be able to copy");
+                }
+                Err(err) => {
+                    event!(Level::ERROR, "Error opening file, {err}");
+                }
+            }
+        }
+    }
+
+    /// Unpack an archive to the specified destination,
+    ///
+    pub async fn unpack(&mut self, path: impl AsRef<str>) {
+        if let Some(mut archive) = self.take() {
+            match archive.unpack(path.as_ref()).await {
+                Ok(_) => {}
+                Err(err) => {
+                    event!(Level::ERROR, "Could not unpack, {err}");
+                }
+            }
+        }
+    }
+
+    /// Streams an archive w/ streamer,
     ///
     pub async fn stream(&mut self, streamer: &mut Streamer) -> Interner {
         let mut interner = Interner::default();
         interner.add_ident("tar");
 
-        if let Some(builder) = self.builder.take() {
-            let archive = builder
-                .into_inner()
-                .await
-                .expect("should be able to take inner stream");
-            let mut archive = Archive::new(archive.as_slice());
-
+        if let Some(mut archive) = self.take() {
             match archive.entries() {
                 Ok(mut entries) => {
                     while let Some(entry) = entries.next().await {
@@ -176,41 +268,40 @@ impl Filesystem {
 
         interner
     }
+}
 
-    /// Imports an archive from a decoder,
-    ///
-    pub async fn import<BlobImpl>(&mut self, decoder: &mut Decoder<'_, BlobImpl>)
-    where
-        BlobImpl: Read + Write + Seek + Clone + Default,
-    {
-        let mut builder = Builder::new(vec![]);
+enum ArchiveSource {
+    Stream(DuplexStream),
+    File(File),
+    Memory(Bytes),
+}
 
-        let files = decoder.decode_properties("tar");
+impl AsyncRead for ArchiveSource {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ArchiveSource::Stream(stream) => {
+                let stream = Pin::new(stream);
 
-        for (name, value) in files.iter_properties() {
-            match value {
-                reality::BlockProperty::Single(value) => {
-                    if let Some(bin) = value.binary() {
-                        let mut archive = Archive::new(bin.as_slice());
-                        let mut entries = archive.entries().unwrap();
+                stream.poll_read(cx, buf)
+            }
+            ArchiveSource::File(file) => {
+                let stream = Pin::new(file);
 
-                        if let Some(entry) = entries.next().await {
-                            let entry = entry.unwrap();
-                            match builder
-                                .append_data(&mut entry.header().clone(), name, entry)
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    event!(Level::ERROR, "Error writing tar entry, {err}");
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+                stream.poll_read(cx, buf)
+            }
+            ArchiveSource::Memory(bytes) => {
+                let mut r = bytes.as_ref();
+                let stream = Pin::new(&mut r);
+
+                stream.poll_read(cx, buf)
             }
         }
+    }
+}
 
         match builder.finish().await {
             Ok(_) => {
