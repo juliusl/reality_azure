@@ -98,7 +98,7 @@ impl StoreIndex {
     ///
     pub async fn index(&mut self, block_list: BlockWithSizeList) {
         let mut offset = 0;
-        let mut encoder = Encoder::default();
+        let mut encoder = Encoder::new();
 
         for block in block_list.blocks {
             if let Some(frame) = self.add_entry(offset, &block) {
@@ -150,6 +150,26 @@ impl StoreIndex {
         })
     }
 
+    /// Returns entries in order,
+    /// 
+    pub fn entries_ordered(&self) -> Vec<Entry> {
+        let index = self.clone();
+        let index = Arc::new(index);
+        let interner = self.interner.clone();
+        let interner = Arc::new(interner);
+        let mut entries = self.map.iter().map(move |(key, range)| Entry {
+            index: index.clone(),
+            store_key: *key,
+            interner: interner.clone(),
+            start: range.start,
+            end: range.end,
+        }).collect::<Vec<_>>();
+
+        entries.sort_by(|a, b| a.start.cmp(&b.start));
+
+        entries
+    }
+
     /// Returns an entry for a key,
     ///
     pub fn entry(&self, key: StoreKey) -> Option<Entry> {
@@ -160,9 +180,9 @@ impl StoreIndex {
 
         if let Some(range) = self.map.get(&key) {
             Some(Entry {
-                index: index,
+                index,
                 store_key: key,
-                interner: interner,
+                interner,
                 start: range.start,
                 end: range.end,
             })
@@ -203,6 +223,14 @@ impl StoreKey {
     ///
     pub fn symbol<'a>(&'a self, interner: &'a Interner) -> Option<&'a String> {
         interner.strings().get(&self.symbol)
+    }
+
+    /// Returns the hash code for this store key,
+    /// 
+    /// This is jsut key ^ symbol
+    /// 
+    pub fn hash_code(&self) -> u64 {
+        self.name ^ self.symbol
     }
 }
 
@@ -308,7 +336,7 @@ impl Entry {
             .symbol()
             .and_then(|s| self.index.blob_device_map.get(s))
         {
-            let mut encoder = Encoder::default();
+            let mut encoder = Encoder::new();
 
             for b in blocks.iter().filter_map(|b| self.index.entry(*b)) {
                 let mut stream = b.pull().await;
@@ -348,5 +376,11 @@ impl Entry {
         };
 
         keys.into_iter().filter_map(|k| self.index.entry(k))
+    }
+
+    /// Returns a hash code for this entry's key,
+    /// 
+    pub fn hash_code(&self) -> u64 {
+        self.key().hash_code()
     }
 }

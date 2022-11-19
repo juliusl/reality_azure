@@ -1,10 +1,15 @@
-use std::io::{Read, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
 
-use reality::wire::{Decoder, Encoder};
+use reality::{
+    wire::{Decoder, Encoder, Frame, Interner},
+    Value,
+};
 use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder};
 use tracing::{event, Level};
+
+use crate::{Blob, Streamer};
 
 /// Struct for encoding/decoding a filesystem to/from the store,
 ///
@@ -40,17 +45,20 @@ impl Filesystem {
         }
     }
 
-    /// Returns an empty filesystem,4
-    /// 
+    /// Returns an empty filesystem,
+    ///
     pub fn empty() -> Self {
         Self { builder: None }
     }
 
     /// Exports the filesystem as an encoder,
     ///
-    pub async fn export(&mut self) -> Option<Encoder> {
+    pub async fn export<BlobImpl>(&mut self) -> Option<Encoder<BlobImpl>>
+    where
+        BlobImpl: Read + Write + Seek + Clone + Default,
+    {
         if let Some(builder) = self.builder.take() {
-            let mut encoder = Encoder::default();
+            let mut encoder = Encoder::<BlobImpl>::default();
 
             let archive = builder
                 .into_inner()
@@ -93,12 +101,80 @@ impl Filesystem {
                 }
             }
 
-            encoder.blob_device.set_position(0);
+            encoder
+                .blob_device
+                .seek(std::io::SeekFrom::Start(0))
+                .expect("should be able to seek to start");
 
             Some(encoder)
         } else {
             None
         }
+    }
+
+    /// Streams this filesystem w/ streamer,
+    ///
+    pub async fn stream(&mut self, streamer: &mut Streamer) -> Interner {
+        let mut interner = Interner::default();
+        interner.add_ident("tar");
+
+        if let Some(builder) = self.builder.take() {
+            let archive = builder
+                .into_inner()
+                .await
+                .expect("should be able to take inner stream");
+            let mut archive = Archive::new(archive.as_slice());
+
+            match archive.entries() {
+                Ok(mut entries) => {
+                    while let Some(entry) = entries.next().await {
+                        match entry {
+                            Ok(mut entry) => {
+                                let header = entry.header();
+                                let path = header
+                                    .path()
+                                    .expect("should be a path")
+                                    .to_str()
+                                    .expect("should be a string")
+                                    .to_string();
+                                let size = header.entry_size().expect("should have a size");
+                                interner.add_ident(&path);
+
+                                let mut buf = entry.header().as_bytes().to_vec();
+                                buf.reserve(size as usize);
+
+                                match entry.read_to_end(&mut buf).await {
+                                    Ok(_) => {
+                                        streamer
+                                            .submit_frame(
+                                                Frame::define(
+                                                    "tar",
+                                                    path,
+                                                    &Value::Empty,
+                                                    &mut Cursor::<[u8; 1]>::default(),
+                                                ),
+                                                Some(Blob::Binary(buf.into())),
+                                            )
+                                            .await;
+                                    }
+                                    Err(err) => {
+                                        event!(Level::ERROR, "Could not read entry {err}");
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                event!(Level::ERROR, "Could not get next entry, {err}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    event!(Level::ERROR, "Could not iterate over entries, {err}");
+                }
+            }
+        }
+
+        interner
     }
 
     /// Imports an archive from a decoder,

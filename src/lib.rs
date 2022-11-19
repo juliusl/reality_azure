@@ -5,7 +5,7 @@ use azure_core::{
 use azure_identity::AzureCliCredential;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::{
-    blob::BlockWithSizeList,
+    blob::{BlockWithSizeList, operations::PutBlock},
     prelude::{BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient, Snapshot},
 };
 use bytes::Bytes;
@@ -17,7 +17,7 @@ use reality::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::{Read, Write},
+    io::{Cursor, Read, Seek, Write},
     sync::Arc,
     time::Duration,
 };
@@ -34,12 +34,22 @@ pub use index::StoreIndex;
 mod filesystem;
 pub use filesystem::Filesystem;
 
+mod streamer;
+pub use streamer::Blob;
+pub use streamer::Streamer;
+
+mod store_stream;
+pub use store_stream::StoreStream;
+
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
-pub struct Store {
+pub struct Store<BlobImpl = Cursor<Vec<u8>>>
+where
+    BlobImpl: Read + Write + Seek + Clone + Default,
+{
     /// Protocol for stored wire objects,
     ///
-    protocol: Protocol,
+    protocol: Protocol<BlobImpl>,
     /// Index of registered object names,
     ///
     index: HashMap<ResourceId, String>,
@@ -59,7 +69,7 @@ pub struct Store {
     ///
     snapshot: Option<Snapshot>,
     /// Store name, defaults to "store"
-    /// 
+    ///
     store_name: &'static str,
 }
 
@@ -110,7 +120,7 @@ impl Store {
     }
 
     /// Registers a wire object w/ the store,
-    /// 
+    ///
     /// Ensures the wire object has an encoder,
     ///
     pub fn register<W>(&mut self, name: impl AsRef<str>)
@@ -128,12 +138,12 @@ impl Store {
             .insert(resource_id.clone(), name.as_ref().to_string());
         self.reverse_index
             .insert(name.as_ref().to_string(), resource_id.clone());
-        
+
         self.set_encoder(resource_id.clone(), Encoder::default());
     }
 
     /// Sets the encoder for resource id, the id must be registered,
-    /// 
+    ///
     pub fn set_encoder(&mut self, resource_id: ResourceId, encoder: Encoder) {
         if self.index.contains_key(&resource_id) {
             self.protocol.set_encoder(resource_id, encoder);
@@ -171,9 +181,9 @@ impl Store {
     }
 
     /// Takes an encoder by id,
-    /// 
+    ///
     pub fn take_encoder_by_id(&mut self, resource_id: ResourceId) -> Option<Encoder> {
-        self.protocol.take_encoder(resource_id) 
+        self.protocol.take_encoder(resource_id)
     }
 
     /// Takes the uploaded store blob data if successfully fetched,
@@ -184,7 +194,8 @@ impl Store {
             .as_ref()
             .clone()
             .expect("should be authenticated to commit the store");
-        let blob_client = container_client.blob_client(&format!("{}/{}", prefix.as_ref(), self.store_name));
+        let blob_client =
+            container_client.blob_client(&format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         match blob_client.exists().await {
@@ -424,6 +435,18 @@ impl Store {
         }
     }
 
+    /// Returns a blob client for a blob at prefix/{store_name} within the container,
+    /// 
+    pub fn get_blob_client(&self, prefix: impl AsRef<str>) -> BlobClient {
+        let container_client = self
+            .container_client
+            .as_ref()
+            .clone()
+            .expect("should be authenticated to commit the store");
+
+        container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name))
+    }
+
     /// Uploading store, returns true if upload completed
     ///
     /// # Wire object layout
@@ -454,7 +477,10 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
+        let blob_client =
+            container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
+
+        let blob_client = Arc::new(blob_client);
 
         let mut interner = Interner::default();
 
@@ -473,7 +499,7 @@ impl Store {
                    - Any extent frames in the stored wire object are replicated and added after the object block
                    <Block with frames>         0x0E        store           <object_name>
                 */
-                let mut extension_encoder = Encoder::default();
+                let mut extension_encoder = Encoder::new();
                 let mut extension = extension_encoder.start_extension("store", name);
 
                 let mut block_list = VecDeque::default();
@@ -499,12 +525,10 @@ impl Store {
                             let mut gz_encoder = GzEncoder::new(vec![], Compression::fast());
 
                             match gz_encoder.write_all(&encoder.blob_device.get_ref()[start..end]) {
-                                Ok(_) => {
-                                    
-                                },
+                                Ok(_) => {}
                                 Err(err) => {
                                     event!(Level::ERROR, "Error wrting to gz encoder, {err}");
-                                },
+                                }
                             }
 
                             let mut task = blob_client.put_block(
@@ -553,27 +577,10 @@ impl Store {
         }
 
         // Handle control_device
-        let control_device = ControlDevice::new(interner);
-        let control_frame = Frame::extension("store", "control");
-        let mut buffer = GzEncoder::new(vec![], Compression::fast());
-        for d in control_device.data {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
-        }
-        for d in control_device.read {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
-        }
-        for d in control_device.index {
-            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
-        }
-        let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
-        let mut upload = blob_client.put_block(
-            control_block_id.clone(),
-            buffer.finish().expect("should be able to compress"),
-        );
-        if let Some(lease_id) = self.lease_id {
-            upload = upload.lease_id(lease_id)
-        }
-        upload_block_futures.push(upload.into_future());
+        
+        let (upload, control_block) = self.put_control_device(interner, blob_client.clone()).await;
+
+        upload_block_futures.push(upload);
 
         // Finish upload blobs
         match try_join_all(upload_block_futures).await {
@@ -589,7 +596,7 @@ impl Store {
         };
         block_list
             .blocks
-            .insert(0, BlobBlockType::new_uncommitted(control_block_id));
+            .insert(0, control_block);
 
         let mut request = blob_client.put_block_list(block_list);
         if let Some(lease_id) = self.lease_id {
@@ -602,6 +609,14 @@ impl Store {
                 false
             }
         }
+    }
+
+    /// Start a stream upload of the store,
+    /// 
+    /// Returns a StoreStream which can be configured by calling .start(), and passing in a select fn,
+    ///
+    pub fn start_stream(&mut self, prefix: impl AsRef<str>) -> StoreStream {
+        StoreStream::new(self, prefix)
     }
 
     /// Commits the store blob to a snapshot and returns the snapshot,
@@ -618,7 +633,8 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
+        let blob_client =
+            container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         let etag = self.etag(blob_client.clone()).await;
@@ -681,7 +697,8 @@ impl Store {
             .clone()
             .expect("should be authenticated to commit the store");
 
-        let blob_client = container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
+        let blob_client =
+            container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
         if let Some(block_list) = self.block_list(blob_client.clone()).await {
@@ -697,6 +714,18 @@ impl Store {
 }
 
 impl Store {
+    /// Registers a filesystem by name,
+    /// 
+    pub fn register_filesystem(&mut self, name: impl AsRef<str>) -> ResourceId {
+        let resource_id = reality::wire::ResourceId::new_with_dynamic_id::<Filesystem>(
+           Interner::default().add_ident(name.as_ref()),
+        );
+
+        self.register_with(resource_id.clone(), name);
+
+        resource_id
+    }
+
     /// Returns an interner after parsing control device frames,
     ///
     pub async fn load_interner(
@@ -729,6 +758,34 @@ impl Store {
 /// Functions to work w/ blobs,
 ///
 impl Store {
+    /// Upload a control device block, returns the request future and block type,
+    /// 
+    pub async fn put_control_device(&self, interner: Interner, blob_client: Arc<BlobClient>) -> (PutBlock, BlobBlockType)  {
+        // Handle control_device
+        let control_device = ControlDevice::new(interner);
+        let control_frame = Frame::extension("store", "control");
+        let mut buffer = GzEncoder::new(vec![], Compression::fast());
+        for d in control_device.data {
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+        }
+        for d in control_device.read {
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+        }
+        for d in control_device.index {
+            std::io::Write::write_all(&mut buffer, d.bytes()).expect("should be able to write");
+        }
+        let control_block_id = Bytes::copy_from_slice(control_frame.bytes());
+        let mut upload = blob_client.put_block(
+            control_block_id.clone(),
+            buffer.finish().expect("should be able to compress"),
+        );
+        if let Some(lease_id) = self.lease_id {
+            upload = upload.lease_id(lease_id)
+        }
+
+        (upload.into_future(), BlobBlockType::new_uncommitted(control_block_id))
+    }
+
     /// Returns the current block list,
     ///
     async fn block_list(&self, blob_client: Arc<BlobClient>) -> Option<BlockWithSizeList> {
