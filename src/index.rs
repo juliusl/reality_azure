@@ -3,6 +3,7 @@ use azure_storage_blobs::{
     blob::{BlobBlockWithSize, BlockWithSizeList},
     prelude::{BlobClient, Snapshot},
 };
+use bytes::{Bytes, BytesMut};
 use reality::wire::{Decoder, Encoder, Frame, Interner};
 use std::{collections::HashMap, ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, DuplexStream};
@@ -67,6 +68,9 @@ pub struct Entry {
     /// End byte range,
     ///
     end: usize,
+    /// Cached bytes for this entry,
+    ///
+    cache: Option<Bytes>,
 }
 
 impl StoreIndex {
@@ -111,7 +115,7 @@ impl StoreIndex {
         if let Some(entry) = self.entries().find(|e| {
             e.name() == Some(&String::from("store")) && e.symbol() == Some(&String::from("control"))
         }) {
-            let _interner = Store::load_interner(entry.pull().await).await;
+            let _interner = Store::load_interner(entry.pull()).await;
             interner = self.interner.merge(&_interner);
         }
 
@@ -147,23 +151,29 @@ impl StoreIndex {
             interner: interner.clone(),
             start: range.start,
             end: range.end,
+            cache: None,
         })
     }
 
     /// Returns entries in order,
-    /// 
+    ///
     pub fn entries_ordered(&self) -> Vec<Entry> {
         let index = self.clone();
         let index = Arc::new(index);
         let interner = self.interner.clone();
         let interner = Arc::new(interner);
-        let mut entries = self.map.iter().map(move |(key, range)| Entry {
-            index: index.clone(),
-            store_key: *key,
-            interner: interner.clone(),
-            start: range.start,
-            end: range.end,
-        }).collect::<Vec<_>>();
+        let mut entries = self
+            .map
+            .iter()
+            .map(move |(key, range)| Entry {
+                index: index.clone(),
+                store_key: *key,
+                interner: interner.clone(),
+                start: range.start,
+                end: range.end,
+                cache: None,
+            })
+            .collect::<Vec<_>>();
 
         entries.sort_by(|a, b| a.start.cmp(&b.start));
 
@@ -185,6 +195,7 @@ impl StoreIndex {
                 interner,
                 start: range.start,
                 end: range.end,
+                cache: None,
             })
         } else {
             None
@@ -226,9 +237,9 @@ impl StoreKey {
     }
 
     /// Returns the hash code for this store key,
-    /// 
+    ///
     /// This is jsut key ^ symbol
-    /// 
+    ///
     pub fn hash_code(&self) -> u64 {
         self.name ^ self.symbol
     }
@@ -239,6 +250,12 @@ impl Entry {
     ///
     pub fn key(&self) -> &StoreKey {
         &self.store_key
+    }
+
+    /// Returns the stored size of this entry,
+    /// 
+    pub fn size(&self) -> usize {
+        self.end - self.start
     }
 
     /// Returns the name of this entry,
@@ -255,7 +272,7 @@ impl Entry {
 
     /// Returns a reader to pull bytes for this entry,
     ///
-    pub async fn pull(&self) -> DuplexStream {
+    pub fn pull(&self) -> DuplexStream {
         Store::pull_byte_range(
             self.index.blob_client.clone(),
             self.start..self.end,
@@ -268,20 +285,8 @@ impl Entry {
     ///
     pub async fn unpack(&self, path: impl AsRef<str>) {
         if self.name() == Some(&String::from("tar")) {
-            let mut bytes = self.pull().await;
-
-            let mut buf = vec![];
-
-            match bytes.read_to_end(&mut buf).await {
-                Ok(read) => {
-                    event!(Level::TRACE, "Read {read} bytes");
-                }
-                Err(err) => {
-                    event!(Level::ERROR, "Could not read blob, {err}");
-                }
-            }
-
-            match Archive::new(buf.as_slice()).unpack(path.as_ref()).await {
+            let buf = self.bytes().await;
+            match Archive::new(buf.as_ref()).unpack(path.as_ref()).await {
                 Ok(_) => {}
                 Err(err) => {
                     event!(Level::ERROR, "Could not unpack as archive, {err}");
@@ -296,7 +301,7 @@ impl Entry {
     ///
     pub async fn file_header(&self) -> Option<Header> {
         if self.name() == Some(&String::from("tar")) {
-            let mut bytes = self.pull().await;
+            let mut bytes = self.pull();
 
             let mut buf = vec![0; 512];
 
@@ -339,7 +344,7 @@ impl Entry {
             let mut encoder = Encoder::new();
 
             for b in blocks.iter().filter_map(|b| self.index.entry(*b)) {
-                let mut stream = b.pull().await;
+                let mut stream = b.pull();
 
                 match stream.read_to_end(encoder.blob_device.get_mut()).await {
                     Ok(_) => {}
@@ -351,7 +356,7 @@ impl Entry {
 
             encoder.interner = self.index.interner.clone();
 
-            let mut frames = self.pull().await;
+            let mut frames = self.pull();
 
             let mut buffer = [0; 64];
             while let Ok(read) = frames.read_exact(&mut buffer).await {
@@ -370,7 +375,11 @@ impl Entry {
     pub fn iter_blob_entries(&self) -> impl Iterator<Item = Entry> + '_ {
         let keys = if self.has_blob_device() {
             let key = self.symbol().expect("should have a symbol");
-            self.index.blob_device_map.get(key).expect("should have keys").clone()
+            self.index
+                .blob_device_map
+                .get(key)
+                .expect("should have keys")
+                .clone()
         } else {
             vec![]
         };
@@ -378,8 +387,57 @@ impl Entry {
         keys.into_iter().filter_map(|k| self.index.entry(k))
     }
 
-    /// Returns a hash code for this entry's key,
+    /// Caches bytes for this entry,
+    ///
+    /// This can be useful if this entry isn't being unpacked to the filesystem, but this entry
+    /// will be around long enough to be called multiple times for bytes.
+    ///  
+    pub async fn cache(&mut self) {
+        let mut size = self.end - self.start;
+        let mut bytes = BytesMut::with_capacity(self.end - self.start);
+
+        while size > 0 {
+            match self.pull().read_buf(&mut bytes).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes");
+                    size -= read;
+                }
+                Err(err) => {
+                    event!(Level::ERROR, "Could not cache entry, {err}");
+                }
+            }
+        }
+
+        self.cache = Some(bytes.into());
+    }
+
+    /// Returns bytes for this entry,
     /// 
+    /// If a cache exists, returns the cached version
+    /// 
+    pub async fn bytes(&self) -> Bytes {
+        if let Some(cached) = self.cache.as_ref() {
+            cached.clone()
+        } else {
+            let mut bytes = self.pull();
+
+            let mut buf = vec![];
+    
+            match bytes.read_to_end(&mut buf).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes");
+                }
+                Err(err) => {
+                    event!(Level::ERROR, "Could not read blob, {err}");
+                }
+            }
+    
+            buf.into()
+        }
+    }
+
+    /// Returns a hash code for this entry's key,
+    ///
     pub fn hash_code(&self) -> u64 {
         self.key().hash_code()
     }
