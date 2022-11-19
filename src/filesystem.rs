@@ -1,6 +1,7 @@
 use std::{
     io::{Cursor, Read, Seek, Write},
-    pin::Pin, path::PathBuf,
+    path::PathBuf,
+    pin::Pin,
 };
 
 use bytes::Bytes;
@@ -177,7 +178,9 @@ impl Filesystem {
         if let Some(mut builder) = self.take() {
             let path = PathBuf::from(path.as_ref());
 
-            tokio::fs::create_dir_all(&path).await.expect("should be able to create dirs");
+            tokio::fs::create_dir_all(&path)
+                .await
+                .expect("should be able to create dirs");
 
             match tokio::fs::OpenOptions::new()
                 .create(true)
@@ -210,7 +213,7 @@ impl Filesystem {
         }
     }
 
-    /// Streams an archive w/ streamer,
+    /// Consumes the inner-archive and stream's w/ streamer,
     ///
     pub async fn stream(&mut self, streamer: &mut Streamer) -> Interner {
         let mut interner = Interner::default();
@@ -270,9 +273,17 @@ impl Filesystem {
     }
 }
 
+/// Enumeration of archive sources,
+/// 
 enum ArchiveSource {
+    /// Archive source from a stream,
+    /// 
     Stream(DuplexStream),
+    /// Archive sourced from a file,
+    /// 
     File(File),
+    /// Archive sourced from memory,
+    /// 
     Memory(Bytes),
 }
 

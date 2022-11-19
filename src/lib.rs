@@ -855,6 +855,7 @@ impl Store {
             while let Some(resp) = stream.next().await {
                 match resp {
                     Ok(r) => {
+                        // Note: Since this is a ranged query, there shouldn't be an additional call
                         let reader = r.data.collect().await.expect("should be able to read");
                         let mut reader = GzDecoder::new(reader.as_ref());
                         let mut buffer = vec![];

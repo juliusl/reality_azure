@@ -83,7 +83,7 @@ impl<'a> StoreStream<'a> {
     ///
     pub async fn start<F>(
         mut self,
-        select: impl Fn(&ResourceId, &Encoder, &StoreStream) -> Option<F>,
+        select: impl Fn(&ResourceId, &Encoder, &StoreStream) -> Option<F> + 'static,
     ) where
         F: Future<Output = Option<Interner>> + Send + 'static,
     {
@@ -96,6 +96,7 @@ impl<'a> StoreStream<'a> {
                 join_set.spawn(future);
             }
         }
+        let future = self.begin_streaming(rx);
 
         tokio::spawn(async move {
             let mut interner = Interner::default();
@@ -123,8 +124,37 @@ impl<'a> StoreStream<'a> {
             }
         });
 
-        let future = self.begin_streaming(rx);
         future.await;
+    }
+
+    /// Try to receive the next messsage,
+    ///
+    async fn try_receive(
+        &mut self,
+        finished: &mut Option<tokio::sync::oneshot::Receiver<Interner>>,
+    ) -> Option<StreamFrame> {
+        if let Some(f) = finished.as_mut() {
+            select! {
+                next = self.rx.recv() => {
+                    next
+                }
+                interner = f => {
+                    match interner {
+                        Ok(interner) => {
+                            self.interner = self.interner.merge(&interner);
+                        },
+                        Err(err) => {
+                            event!(Level::ERROR, "Error trying to receive interner, {err}");
+                        },
+                    }
+                    finished.take();
+                    self.rx.close();
+                    self.rx.recv().await
+                }
+            }
+        } else {
+            self.rx.recv().await
+        }
     }
 
     /// Begin receiving frames for stream uploading,
@@ -249,36 +279,6 @@ impl<'a> StoreStream<'a> {
             Err(err) => {
                 event!(Level::ERROR, "Could not put block list, {err}");
             }
-        }
-    }
-
-    /// Try to receive the next messsage,
-    ///
-    pub async fn try_receive(
-        &mut self,
-        finished: &mut Option<tokio::sync::oneshot::Receiver<Interner>>,
-    ) -> Option<StreamFrame> {
-        if let Some(f) = finished.as_mut() {
-            select! {
-                next = self.rx.recv() => {
-                    next
-                }
-                interner = f => {
-                    match interner {
-                        Ok(interner) => {
-                            self.interner = self.interner.merge(&interner);
-                        },
-                        Err(err) => {
-                            event!(Level::ERROR, "Error trying to receive interner, {err}");
-                        },
-                    }
-                    finished.take();
-                    self.rx.close();
-                    self.rx.recv().await
-                }
-            }
-        } else {
-            self.rx.recv().await
         }
     }
 }
