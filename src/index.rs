@@ -4,10 +4,10 @@ use azure_storage_blobs::{
     prelude::{BlobClient, Snapshot},
 };
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use reality::wire::{Decoder, Encoder, Frame, Interner};
 use std::{collections::HashMap, ops::Range, sync::Arc};
-use tokio::io::{AsyncReadExt, DuplexStream, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_tar::{Archive, Header};
 use tracing::{event, Level};
 
@@ -349,10 +349,10 @@ impl Entry {
             match stream.read_to_end(encoder.blob_device.get_mut()).await {
                 Ok(read) => {
                     event!(Level::TRACE, "Read {read} bytes");
-                },
+                }
                 Err(err) => {
                     event!(Level::ERROR, "Error reading blob device stream, {err}");
-                },
+                }
             }
 
             encoder.interner = self.index.interner.clone();
@@ -367,7 +367,7 @@ impl Entry {
 
             Some(encoder)
         } else {
-            None 
+            None
         }
     }
 
@@ -407,10 +407,10 @@ impl Entry {
                     match sender.write_all(next.as_ref()).await {
                         Ok(_) => {
                             event!(Level::TRACE, "Sent {next_len} bytes");
-                        },
+                        }
                         Err(err) => {
                             event!(Level::ERROR, "Error sending bytes, {err}");
-                        },
+                        }
                     }
                 }
             });
@@ -419,6 +419,33 @@ impl Entry {
         } else {
             None
         }
+    }
+
+    /// Manually join's blob devices with an accumalator `T`,
+    ///
+    /// Call on_blob on each blob read from blob device entries. Blobs are processed in order,
+    /// but are fetched in parallel.
+    ///
+    pub async fn join_blob_device<T, F>(&self, mut acc: T, on_blob: impl Fn(T, Entry, Bytes) -> F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if self.has_blob_device() {
+            let mut blocks = futures::stream::FuturesOrdered::new();
+
+            for entry in self.iter_blob_entries() {
+                blocks.push_back(async move {
+                    let bytes = entry.bytes().await;
+                    (entry, bytes)
+                });
+            }
+
+            while let Some((entry, next)) = blocks.next().await {
+                acc = on_blob(acc, entry, next).await;
+            }
+        }
+
+        acc
     }
 
     /// Caches bytes for this entry,

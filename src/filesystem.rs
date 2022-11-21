@@ -11,13 +11,13 @@ use reality::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, DuplexStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, AsyncWrite},
 };
 use tokio_stream::StreamExt;
-use tokio_tar::{Archive, Builder};
+use tokio_tar::{Archive, Builder, Header};
 use tracing::{event, Level};
 
-use crate::{Blob, Streamer};
+use crate::{Blob, Streamer, index::Entry};
 
 /// Struct for encoding/decoding a filesystem to/from the store,
 ///
@@ -126,7 +126,9 @@ impl Filesystem {
 
     /// Imports an archive from a decoder,
     ///
-    pub async fn import<BlobImpl>(decoder: &mut Decoder<'_, BlobImpl>) -> std::io::Result<Filesystem>
+    pub async fn import<BlobImpl>(
+        decoder: &mut Decoder<'_, BlobImpl>,
+    ) -> std::io::Result<Filesystem>
     where
         BlobImpl: Read + Write + Seek + Clone + Default,
     {
@@ -166,14 +168,14 @@ impl Filesystem {
                     .await
                     .expect("should be able to get inner");
 
-                Ok(Self { 
-                    archive: Some(ArchiveSource::Memory(Cursor::new(inner.into())))
+                Ok(Self {
+                    archive: Some(ArchiveSource::Memory(Cursor::new(inner.into()))),
                 })
             }
             Err(err) => {
                 event!(Level::ERROR, "Could not finish building archive, {err}");
                 Err(err)
-            },
+            }
         }
     }
 
@@ -276,9 +278,64 @@ impl Filesystem {
                     event!(Level::ERROR, "Could not iterate over entries, {err}");
                 }
             }
+
+            let mut eof = vec![];
+            match archive.read_to_end(&mut eof).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes, at EOF");
+                }
+                Err(err) => {
+                    event!(Level::ERROR, "Could not read end of file, {err}");
+                }
+            }
+
+            streamer
+                .submit_frame(
+                    Frame::define(
+                        "tar",
+                        "EOF",
+                        &Value::Empty,
+                        &mut Cursor::<[u8; 1]>::default(),
+                    ),
+                    Some(Blob::Binary(eof.into())),
+                )
+                .await;
         }
 
         interner
+    }
+
+    /// Writes an archive to writer, w/ the parent fs entry
+    /// 
+    pub async fn write_to<W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry, writer: W) {
+        let builder = Builder::new(writer);
+
+        parent_entry.join_blob_device(builder, |mut builder, entry, mut blob| async move {
+            if entry.symbol() != Some(&String::from("EOF")) {
+                let header = Header::from_byte_slice(&blob[..512]);
+
+                match builder.append(header, &blob.clone()[512..]).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        event!(Level::ERROR, "Error appending entry to builder, {err}");
+                    }
+                }
+            } else {
+                // This is a weird case where the EOF footer from the original extends 1 block further than expected
+                // This is a naive attempt to patch that, since 2 x 512 blocks will be applied on drop(builder) by removing 1 x 512 block of zeros
+                if blob.len() > 1024 {
+                    blob.truncate(blob.len() - 512);
+                }
+
+                builder
+                    .get_mut()
+                    .write_all(&blob)
+                    .await
+                    .expect("should be able to write end");
+            }
+            builder
+        })
+        .await;
     }
 }
 
