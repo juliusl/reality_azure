@@ -126,7 +126,7 @@ impl Filesystem {
 
     /// Imports an archive from a decoder,
     ///
-    pub async fn import<BlobImpl>(&mut self, decoder: &mut Decoder<'_, BlobImpl>)
+    pub async fn import<BlobImpl>(decoder: &mut Decoder<'_, BlobImpl>) -> std::io::Result<Filesystem>
     where
         BlobImpl: Read + Write + Seek + Clone + Default,
     {
@@ -166,19 +166,24 @@ impl Filesystem {
                     .await
                     .expect("should be able to get inner");
 
-                self.archive = Some(ArchiveSource::Memory(inner.into()));
+                Ok(Self { 
+                    archive: Some(ArchiveSource::Memory(Cursor::new(inner.into())))
+                })
             }
-            Err(err) => event!(Level::ERROR, "Could not finish building archive, {err}"),
+            Err(err) => {
+                event!(Level::ERROR, "Could not finish building archive, {err}");
+                Err(err)
+            },
         }
     }
 
     /// Writes the current archive to disk,
     ///
     pub async fn write_disk(&mut self, path: impl AsRef<str>) {
-        if let Some(mut builder) = self.take() {
+        if let Some(builder) = self.take() {
             let path = PathBuf::from(path.as_ref());
 
-            tokio::fs::create_dir_all(&path)
+            tokio::fs::create_dir_all(&path.parent().unwrap())
                 .await
                 .expect("should be able to create dirs");
 
@@ -188,11 +193,14 @@ impl Filesystem {
                 .open(path)
                 .await
             {
-                Ok(mut file) => {
-                    tokio::io::copy(&mut builder, &mut file)
-                        .await
-                        .expect("should be able to copy");
-                }
+                Ok(mut file) => match builder.into_inner() {
+                    Ok(mut r) => {
+                        tokio::io::copy(&mut r, &mut file)
+                            .await
+                            .expect("should be able to copy");
+                    }
+                    Err(_) => todo!(),
+                },
                 Err(err) => {
                     event!(Level::ERROR, "Error opening file, {err}");
                 }
@@ -218,6 +226,7 @@ impl Filesystem {
     pub async fn stream(&mut self, streamer: &mut Streamer) -> Interner {
         let mut interner = Interner::default();
         interner.add_ident("tar");
+        interner.add_ident("EOF");
 
         if let Some(mut archive) = self.take() {
             match archive.entries() {
@@ -274,17 +283,17 @@ impl Filesystem {
 }
 
 /// Enumeration of archive sources,
-/// 
+///
 enum ArchiveSource {
     /// Archive source from a stream,
-    /// 
+    ///
     Stream(DuplexStream),
     /// Archive sourced from a file,
-    /// 
+    ///
     File(File),
     /// Archive sourced from memory,
-    /// 
-    Memory(Bytes),
+    ///
+    Memory(Cursor<Bytes>),
 }
 
 impl AsyncRead for ArchiveSource {
@@ -305,8 +314,7 @@ impl AsyncRead for ArchiveSource {
                 stream.poll_read(cx, buf)
             }
             ArchiveSource::Memory(bytes) => {
-                let mut r = bytes.as_ref();
-                let stream = Pin::new(&mut r);
+                let stream = Pin::new(bytes);
 
                 stream.poll_read(cx, buf)
             }

@@ -4,9 +4,10 @@ use azure_storage_blobs::{
     prelude::{BlobClient, Snapshot},
 };
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use reality::wire::{Decoder, Encoder, Frame, Interner};
 use std::{collections::HashMap, ops::Range, sync::Arc};
-use tokio::io::{AsyncReadExt, DuplexStream};
+use tokio::io::{AsyncReadExt, DuplexStream, AsyncWriteExt};
 use tokio_tar::{Archive, Header};
 use tracing::{event, Level};
 
@@ -49,7 +50,7 @@ pub struct StoreKey {
     ///
     symbol: u64,
     /// Original frame,
-    /// 
+    ///
     frame: Frame,
 }
 
@@ -258,7 +259,7 @@ impl Entry {
     }
 
     /// Returns the stored size of this entry,
-    /// 
+    ///
     pub fn size(&self) -> usize {
         self.end - self.start
     }
@@ -342,21 +343,16 @@ impl Entry {
     /// Returns a fully loaded encoder for this entry,
     ///
     pub async fn encoder(&self) -> Option<Encoder> {
-        if let Some(blocks) = self
-            .symbol()
-            .and_then(|s| self.index.blob_device_map.get(s))
-        {
+        if let Some(mut stream) = self.stream_blob_device(4096) {
             let mut encoder = Encoder::new();
 
-            for b in blocks.iter().filter_map(|b| self.index.entry(b.clone())) {
-                let mut stream = b.pull();
-
-                match stream.read_to_end(encoder.blob_device.get_mut()).await {
-                    Ok(_) => {}
-                    Err(err) => {
-                        event!(Level::ERROR, "Error reading bytes for blob device, {err}");
-                    }
-                }
+            match stream.read_to_end(encoder.blob_device.get_mut()).await {
+                Ok(read) => {
+                    event!(Level::TRACE, "Read {read} bytes");
+                },
+                Err(err) => {
+                    event!(Level::ERROR, "Error reading blob device stream, {err}");
+                },
             }
 
             encoder.interner = self.index.interner.clone();
@@ -371,7 +367,7 @@ impl Entry {
 
             Some(encoder)
         } else {
-            None
+            None 
         }
     }
 
@@ -390,6 +386,39 @@ impl Entry {
         };
 
         keys.into_iter().filter_map(|k| self.index.entry(k))
+    }
+
+    /// If entry has child blob entries, concatenates each into a single stream,
+    ///
+    pub fn stream_blob_device(&self, buffer_size: usize) -> Option<DuplexStream> {
+        if self.has_blob_device() {
+            let (mut sender, receiver) = tokio::io::duplex(buffer_size);
+
+            let mut blocks = futures::stream::FuturesOrdered::new();
+
+            for entry in self.iter_blob_entries() {
+                blocks.push_back(async move { entry.bytes().await });
+            }
+
+            tokio::task::spawn(async move {
+                while let Some(next) = blocks.next().await {
+                    let next_len = next.len();
+
+                    match sender.write_all(next.as_ref()).await {
+                        Ok(_) => {
+                            event!(Level::TRACE, "Sent {next_len} bytes");
+                        },
+                        Err(err) => {
+                            event!(Level::ERROR, "Error sending bytes, {err}");
+                        },
+                    }
+                }
+            });
+
+            Some(receiver)
+        } else {
+            None
+        }
     }
 
     /// Caches bytes for this entry,
@@ -417,9 +446,9 @@ impl Entry {
     }
 
     /// Returns bytes for this entry,
-    /// 
+    ///
     /// If a cache exists, returns the cached version
-    /// 
+    ///
     pub async fn bytes(&self) -> Bytes {
         if let Some(cached) = self.cache.as_ref() {
             cached.clone()
@@ -427,7 +456,7 @@ impl Entry {
             let mut bytes = self.pull();
 
             let mut buf = vec![];
-    
+
             match bytes.read_to_end(&mut buf).await {
                 Ok(read) => {
                     event!(Level::TRACE, "Read {read} bytes");
@@ -436,7 +465,7 @@ impl Entry {
                     event!(Level::ERROR, "Could not read blob, {err}");
                 }
             }
-    
+
             buf.into()
         }
     }
