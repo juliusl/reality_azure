@@ -5,19 +5,20 @@ use std::{
 };
 
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use reality::{
     wire::{Decoder, Encoder, Frame, Interner},
     Value,
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
 };
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder, Header};
 use tracing::{event, Level};
 
-use crate::{Blob, Streamer, index::Entry};
+use crate::{index::Entry, Blob, Streamer};
 
 /// Struct for encoding/decoding a filesystem to/from the store,
 ///
@@ -30,9 +31,45 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
+    /// Opens a compressed archive,
+    ///
+    pub fn open_tar_gz(path: impl AsRef<str>) -> Option<Self> {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .open(path.as_ref())
+        {
+            Ok(stream) => {
+                let (reader, mut writer) = tokio::io::duplex(4096);
+
+                tokio::spawn(async move {
+                    let mut gz = GzDecoder::new(stream);
+                    let mut buf = vec![];
+                    if let Ok(_) = gz.read_to_end(&mut buf) {
+                        match writer.write_all(&buf).await {
+                            Ok(_) => {
+                                
+                            },
+                            Err(err) => {
+                                event!(Level::ERROR, "Error writing buf, {err}");
+                            },
+                        }
+                    }
+                });
+
+                Some(Self {
+                    archive: Some(ArchiveSource::Stream(reader)),
+                })
+            },
+            Err(err) => {
+                event!(Level::ERROR, "Could not load tar.gz, {err}");
+                None
+            },
+        }
+    }
+
     /// Load archive from the filesystem,
     ///
-    pub async fn load_tar(path: impl AsRef<str>) -> Option<Self> {
+    pub async fn open_tar(path: impl AsRef<str>) -> Option<Self> {
         match tokio::fs::OpenOptions::new()
             .read(true)
             .open(path.as_ref())
@@ -306,36 +343,40 @@ impl Filesystem {
     }
 
     /// Writes an archive to writer, w/ the parent fs entry
-    /// 
-    pub async fn write_to<W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry, writer: W) {
+    ///
+    pub async fn write_to<W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry, writer: W) -> std::io::Result<()> {
         let builder = Builder::new(writer);
 
-        parent_entry.join_blob_device(builder, |mut builder, entry, mut blob| async move {
-            if entry.symbol() != Some(&String::from("EOF")) {
-                let header = Header::from_byte_slice(&blob[..512]);
+        let builder = parent_entry
+            .join_blob_device(builder, |mut builder, entry, mut blob| async move {
+                if entry.symbol() != Some(&String::from("EOF")) {
+                    let header = Header::from_byte_slice(&blob[..512]);
 
-                match builder.append(header, &blob.clone()[512..]).await {
-                    Ok(_) => {}
-                    Err(err) => {
-                        event!(Level::ERROR, "Error appending entry to builder, {err}");
+                    match builder.append(header, &blob.clone()[512..]).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            event!(Level::ERROR, "Error appending entry to builder, {err}");
+                        }
                     }
-                }
-            } else {
-                // This is a weird case where the EOF footer from the original extends 1 block further than expected
-                // This is a naive attempt to patch that, since 2 x 512 blocks will be applied on drop(builder) by removing 1 x 512 block of zeros
-                if blob.len() > 1024 {
-                    blob.truncate(blob.len() - 512);
-                }
+                } else {
+                    // This is a weird case where the EOF footer from the original extends 1 block further than expected
+                    // This is a naive attempt to patch that, since 2 x 512 blocks will be applied on drop(builder) by removing 1 x 512 block of zeros
+                    if blob.len() > 1024 {
+                        blob.truncate(blob.len() - 512);
+                    }
 
+                    builder
+                        .get_mut()
+                        .write_all(&blob)
+                        .await
+                        .expect("should be able to write end");
+                }
                 builder
-                    .get_mut()
-                    .write_all(&blob)
-                    .await
-                    .expect("should be able to write end");
-            }
-            builder
-        })
-        .await;
+            })
+            .await;
+        
+        let mut builder = builder.into_inner().await.expect("should be able to get inner");
+        builder.shutdown().await
     }
 }
 

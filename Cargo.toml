@@ -25,3 +25,4 @@ tracing = "0.1.37"
 flate2 = "1.0.24"
 tokio-tar = "0.3.0"
 tokio-stream = "0.1.11"
+async-compression = { version = "0.3.15", features = ["tokio", "gzip"] }
