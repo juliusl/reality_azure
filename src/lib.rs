@@ -30,6 +30,8 @@ pub use reality::wire::WireObject;
 
 mod index;
 pub use index::StoreIndex;
+pub use index::Entry;
+pub use index::StoreKey;
 
 mod filesystem;
 pub use filesystem::Filesystem;
