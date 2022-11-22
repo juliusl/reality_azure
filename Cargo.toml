@@ -16,7 +16,7 @@ azure_identity = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", br
 azure_storage_blobs = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
 azure_core = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
 
-reality = { git = "https://github.com/juliusl/reality.git", branch="pr/protocol-v2" }
+reality = { git = "https://github.com/juliusl/reality.git", branch="pr/protocol-v2-refactor" }
 bytes = "1.2.1"
 tokio = { version = "1.20.1", features = ["default", "rt-multi-thread", "sync", "fs", "process", "io-util", "io-std", "macros"] }
 futures-lite = "1.12.0"
