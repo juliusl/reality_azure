@@ -6,15 +6,15 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-
+# The next release should have the below fixes
 # azure_storage = "0.7.0"
 # azure_identity = "0.7.0"
 # azure_storage_blobs = "0.7.0"
 # azure_core = "0.6.0"
-azure_storage = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
-azure_identity = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
-azure_storage_blobs = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
-azure_core = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/fix-header" }
+azure_storage = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/block-id-conversion" }
+azure_identity = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/block-id-conversion" }
+azure_storage_blobs = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/block-id-conversion" }
+azure_core = { git = "https://github.com/juliusl/azure-sdk-for-rust.git", branch="pr/block-id-conversion" }
 
 reality = { git = "https://github.com/juliusl/reality.git", branch="pr/protocol-v2" }
 bytes = "1.2.1"

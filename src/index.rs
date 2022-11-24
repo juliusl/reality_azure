@@ -11,26 +11,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_tar::{Archive, Header};
 use tracing::{event, Level};
 
-use crate::Store;
+use crate::{AzureBlobClient, Store};
 
 /// Struct for a store index,
 ///
 /// Indexes all interned content,
 ///
 #[derive(Clone)]
-pub struct StoreIndex {
+pub struct StoreIndex<Client>
+where
+    Client: reality::wire::BlobClient,
+{
     /// Interner for decoding string references,
     ///
     interner: Interner,
     /// Blob client for the store,
     ///
-    blob_client: Arc<BlobClient>,
-    /// Snapshot id,
-    ///
-    snapshot_id: Option<Snapshot>,
-    /// Lease id
-    ///
-    lease_id: Option<LeaseId>,
+    blob_client: Client,
     /// Map of byte ranges,
     ///
     map: HashMap<StoreKey, Range<usize>>,
@@ -56,10 +53,13 @@ pub struct StoreKey {
 
 /// Struct for an entry in the index,
 ///
-pub struct Entry {
+pub struct Entry<Client>
+where
+    Client: reality::wire::BlobClient,
+{
     /// Parent index of this entry,
     ///
-    index: Arc<StoreIndex>,
+    index: Arc<StoreIndex<Client>>,
     /// Store key of this entry,
     ///
     store_key: StoreKey,
@@ -77,23 +77,28 @@ pub struct Entry {
     cache: Option<Bytes>,
 }
 
-impl StoreIndex {
-    /// Creates a new empty store index,
+impl<Client> StoreIndex<Client>
+where
+    Client: reality::wire::BlobClient
+{
+    /// Creates a new empty store index for azure storage,
     ///
-    pub fn empty(
-        blob_client: Arc<BlobClient>,
+    pub fn new_azure(
+        client: Arc<BlobClient>,
         lease_id: Option<LeaseId>,
         snapshot_id: Option<Snapshot>,
-    ) -> Self {
+    ) -> StoreIndex<AzureBlobClient> {
         let mut interner = Interner::default();
         interner.add_ident("store");
         interner.add_ident("control");
         interner.add_ident("");
 
         let index = StoreIndex {
-            blob_client,
-            snapshot_id,
-            lease_id,
+            blob_client: AzureBlobClient {
+                client,
+                lease_id,
+                snapshot_id,
+            },
             interner,
             map: HashMap::default(),
             blob_device_map: HashMap::default(),
@@ -145,12 +150,12 @@ impl StoreIndex {
 
     /// Returns entries,
     ///
-    pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+    pub fn entries(&self) -> impl Iterator<Item = Entry<Client>> + '_ {
         let index = self.clone();
         let index = Arc::new(index);
         let interner = self.interner.clone();
         let interner = Arc::new(interner);
-        self.map.iter().map(move |(key, range)| Entry {
+        self.map.iter().map(move |(key, range)| Entry::<Client> {
             index: index.clone(),
             store_key: key.clone(),
             interner: interner.clone(),
@@ -162,7 +167,7 @@ impl StoreIndex {
 
     /// Returns entries in order,
     ///
-    pub fn entries_ordered(&self) -> Vec<Entry> {
+    pub fn entries_ordered(&self) -> Vec<Entry<Client>> {
         let index = self.clone();
         let index = Arc::new(index);
         let interner = self.interner.clone();
@@ -187,7 +192,7 @@ impl StoreIndex {
 
     /// Returns an entry for a key,
     ///
-    pub fn entry(&self, key: StoreKey) -> Option<Entry> {
+    pub fn entry(&self, key: StoreKey) -> Option<Entry<Client>> {
         let index = self.clone();
         let index = Arc::new(index);
         let interner = self.interner.clone();
@@ -212,7 +217,7 @@ impl StoreIndex {
     fn add_entry(&mut self, offset: usize, block: &BlobBlockWithSize) -> Option<Frame> {
         match &block.block_list_type {
             azure_storage_blobs::prelude::BlobBlockType::Committed(block_id) => {
-                let frame = Frame::from(block_id.as_ref());
+                let frame = Frame::from(block_id.bytes());
                 let key = StoreKey {
                     name: frame.name_key(),
                     symbol: frame.symbol_key(),
@@ -251,7 +256,10 @@ impl StoreKey {
     }
 }
 
-impl Entry {
+impl<Client> Entry<Client>
+where
+    Client: reality::wire::BlobClient
+{
     /// Returns the name of the entry,
     ///
     pub fn key(&self) -> &StoreKey {
@@ -278,13 +286,8 @@ impl Entry {
 
     /// Returns a reader to pull bytes for this entry,
     ///
-    pub fn pull(&self) -> DuplexStream {
-        Store::pull_byte_range(
-            self.index.blob_client.clone(),
-            self.start..self.end,
-            self.index.lease_id,
-            self.index.snapshot_id.clone(),
-        )
+    pub fn pull(&self) -> Client::Stream {
+        self.index.blob_client.stream_range(self.start..self.end)
     }
 
     /// If name is "tar", unpacks this as a file to path,
@@ -373,7 +376,7 @@ impl Entry {
 
     /// Return blob device entries that belong to this entry,
     ///
-    pub fn iter_blob_entries(&self) -> impl Iterator<Item = Entry> + '_ {
+    pub fn iter_blob_entries(&self) -> impl Iterator<Item = Entry<Client>> + '_ {
         let keys = if self.has_blob_device() {
             let key = self.symbol().expect("should have a symbol");
             self.index
@@ -426,7 +429,11 @@ impl Entry {
     /// Call on_blob on each blob read from blob device entries. Blobs are processed in order,
     /// but are fetched in parallel.
     ///
-    pub async fn join_blob_device<T, F>(&self, mut acc: T, on_blob: impl Fn(T, Entry, Bytes) -> F) -> T
+    pub async fn join_blob_device<T, F>(
+        &self,
+        mut acc: T,
+        on_blob: impl Fn(T, Entry<Client>, Bytes) -> F,
+    ) -> T
     where
         F: Future<Output = T>,
     {

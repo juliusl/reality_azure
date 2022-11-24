@@ -28,6 +28,9 @@ pub use reality::wire::Decoder;
 pub use reality::wire::Encoder;
 pub use reality::wire::WireObject;
 
+mod azure_blob_client;
+pub use azure_blob_client::AzureBlobClient;
+
 mod index;
 pub use index::StoreIndex;
 pub use index::Entry;
@@ -690,7 +693,7 @@ impl Store {
 
     /// Returns a store index,
     ///
-    pub async fn index(&self, prefix: impl AsRef<str>) -> Option<StoreIndex> {
+    pub async fn index(&self, prefix: impl AsRef<str>) -> Option<StoreIndex<AzureBlobClient>> {
         let container_client = self
             .container_client
             .as_ref()
@@ -702,7 +705,7 @@ impl Store {
         let blob_client = Arc::new(blob_client);
 
         if let Some(block_list) = self.block_list(blob_client.clone()).await {
-            let mut index = StoreIndex::empty(blob_client, self.lease_id, self.snapshot.clone());
+            let mut index = StoreIndex::<AzureBlobClient>::new_azure(blob_client, self.lease_id, self.snapshot.clone());
 
             index.index(block_list).await;
 

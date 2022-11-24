@@ -344,7 +344,8 @@ impl Filesystem {
 
     /// Writes an archive to writer, w/ the parent fs entry
     ///
-    pub async fn write_to<W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry, writer: W) -> std::io::Result<()> {
+    pub async fn write_to<Client: reality::wire::BlobClient, W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry<Client>, writer: W) -> std::io::Result<()> 
+    {
         let builder = Builder::new(writer);
 
         let builder = parent_entry
