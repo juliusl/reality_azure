@@ -5,14 +5,13 @@ use azure_core::{
 use azure_identity::AzureCliCredential;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::{
-    blob::{BlockWithSizeList, operations::PutBlock},
+    blob::{operations::PutBlock, BlockWithSizeList},
     prelude::{BlobBlockType, BlobClient, BlobServiceClient, BlockList, ContainerClient, Snapshot},
 };
-use bytes::Bytes;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use futures::{future::try_join_all, StreamExt};
 use reality::{
-    wire::{ControlDevice, Data, Frame, Interner, Protocol, ResourceId},
+    store::{StoreIndex, StoreStream, StoreContainer},
+    wire::{BlockStore, ControlDevice, Data, Frame, FrameBuffer, Interner, Protocol, ResourceId},
     Keywords,
 };
 use std::{
@@ -20,6 +19,7 @@ use std::{
     io::{Cursor, Read, Seek, Write},
     sync::Arc,
     time::Duration,
+    vec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tracing::{event, trace, Level};
@@ -28,23 +28,17 @@ pub use reality::wire::Decoder;
 pub use reality::wire::Encoder;
 pub use reality::wire::WireObject;
 
-mod azure_blob_client;
-pub use azure_blob_client::AzureBlobClient;
+mod azure_block_client;
+pub use azure_block_client::AzureBlockClient;
 
-mod index;
-pub use index::StoreIndex;
-pub use index::Entry;
-pub use index::StoreKey;
+mod azure_block_store;
+pub use azure_block_store::AzureBlockStore;
+
+mod archive_block_client;
+pub use archive_block_client::ArchiveBlockClient;
 
 mod filesystem;
 pub use filesystem::Filesystem;
-
-mod streamer;
-pub use streamer::Blob;
-pub use streamer::Streamer;
-
-mod store_stream;
-pub use store_stream::StoreStream;
 
 /// Struct for uploading/fetching protocol data from azure storage,
 ///
@@ -174,7 +168,7 @@ impl Store {
     where
         W: WireObject,
     {
-        if let Some(mut encoder) = self.protocol.take_encoder(W::resource_id()) {
+        if let Some(mut encoder) = self.protocol.take_encoder(&W::resource_id()) {
             self.protocol.ensure_encoder::<W>();
 
             encoder.frame_index = W::build_index(&encoder.interner, &encoder.frames);
@@ -188,7 +182,7 @@ impl Store {
     /// Takes an encoder by id,
     ///
     pub fn take_encoder_by_id(&mut self, resource_id: ResourceId) -> Option<Encoder> {
-        self.protocol.take_encoder(resource_id)
+        self.protocol.take_encoder(&resource_id)
     }
 
     /// Takes the uploaded store blob data if successfully fetched,
@@ -298,7 +292,10 @@ impl Store {
             for block in block_list.blocks.iter() {
                 match &block.block_list_type {
                     BlobBlockType::Committed(frame) => {
-                        let frame = Frame::from(frame.as_ref());
+                        let frames = block.size_in_bytes / 64;
+                        let mut frame_buffer = FrameBuffer::new(frames as usize);
+
+                        let frame = Frame::from(frame.bytes());
                         match (frame.name(&interner), frame.symbol(&interner)) {
                             (Some(name), Some(symbol)) => match (name.as_str(), symbol.as_str()) {
                                 ("store", "control") => {
@@ -311,10 +308,11 @@ impl Store {
 
                                     let mut control_device = ControlDevice::default();
 
-                                    let mut buffer = [0; 64];
-                                    while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                    let mut b = frame_buffer.next();
+                                    while let Ok(r) = reader.read_exact(b.as_mut()).await {
                                         assert_eq!(r, 64);
-                                        let frame = Frame::from(buffer.as_ref());
+                                        let frame = Frame::from(b.freeze());
+                                        b = frame_buffer.next();
                                         if frame.op() == 0x00 {
                                             control_device.data.push(frame.clone());
                                         } else if frame.op() > 0x00 && frame.op() < 0x06 {
@@ -326,7 +324,6 @@ impl Store {
                                             );
                                             control_device.index.push(frame.clone());
                                         }
-                                        buffer = [0; 64];
                                     }
 
                                     interner = interner.merge(&control_device.into());
@@ -350,10 +347,14 @@ impl Store {
             // Build objects
             let mut offset = 0;
             let mut current_encoder = None::<ResourceId>;
+
             for block in block_list.blocks.iter() {
                 match &block.block_list_type {
                     BlobBlockType::Committed(frame) => {
-                        let frame = Frame::from(frame.as_ref());
+                        let frames = block.size_in_bytes / 64;
+                        let mut frame_buffer = FrameBuffer::new(frames as usize);
+
+                        let frame = Frame::from(frame.bytes());
                         match (frame.name(&interner), frame.symbol(&interner)) {
                             (Some(name), Some(symbol))
                                 if frame.keyword() == Keywords::Extension =>
@@ -366,7 +367,7 @@ impl Store {
                                             self.reverse_index.get(symbol).and_then(|id| {
                                                 Some((
                                                     id,
-                                                    self.protocol.encoder_mut_by_id(id.clone()),
+                                                    self.protocol.encoder_mut_by_id(&id.clone()),
                                                 ))
                                             })
                                         {
@@ -377,12 +378,12 @@ impl Store {
                                                 self.snapshot.clone(),
                                             );
 
-                                            let mut buffer = [0; 64];
-                                            while let Ok(r) = reader.read_exact(&mut buffer).await {
+                                            let mut b = frame_buffer.next();
+                                            while let Ok(r) = reader.read_exact(b.as_mut()).await {
                                                 assert_eq!(r, 64);
-                                                let frame = Frame::from(buffer);
+                                                let frame = Frame::from(b.freeze());
+                                                b = frame_buffer.next();
                                                 encoder.frames.push(frame);
-                                                buffer = [0; 64];
                                             }
 
                                             encoder.interner = interner.clone();
@@ -396,7 +397,7 @@ impl Store {
                             _ if frame.is_extent() => {
                                 if let Some(id) = current_encoder.as_ref() {
                                     if let Some(encoder) =
-                                        self.protocol.encoder_mut_by_id(id.clone())
+                                        self.protocol.encoder_mut_by_id(&id.clone())
                                     {
                                         let mut reader = Self::pull_byte_range(
                                             blob_client.clone(),
@@ -441,7 +442,7 @@ impl Store {
     }
 
     /// Returns a blob client for a blob at prefix/{store_name} within the container,
-    /// 
+    ///
     pub fn get_blob_client(&self, prefix: impl AsRef<str>) -> BlobClient {
         let container_client = self
             .container_client
@@ -508,7 +509,11 @@ impl Store {
                 let mut extension = extension_encoder.start_extension("store", name);
 
                 let mut block_list = VecDeque::default();
-                let mut buffer = GzEncoder::new(vec![], Compression::fast());
+                let buf = vec![];
+                let mut buffer = async_compression::tokio::write::GzipEncoder::with_quality(
+                    buf,
+                    async_compression::Level::Fastest,
+                );
 
                 interner.add_ident(name);
                 interner = interner.merge(&encoder.interner);
@@ -526,21 +531,25 @@ impl Store {
                             let start = cursor as usize;
                             let end = start + length as usize;
 
-                            let mut gz_encoder = GzEncoder::new(vec![], Compression::fast());
+                            let buf = vec![];
+                            let mut gz_encoder =
+                                async_compression::tokio::write::GzipEncoder::with_quality(
+                                    buf,
+                                    async_compression::Level::Fastest,
+                                );
 
-                            match gz_encoder.write_all(&encoder.blob_device.get_ref()[start..end]) {
+                            match gz_encoder
+                                .write_all(&encoder.blob_device.get_ref()[start..end])
+                                .await
+                            {
                                 Ok(_) => {}
                                 Err(err) => {
                                     event!(Level::ERROR, "Error wrting to gz encoder, {err}");
                                 }
                             }
 
-                            let mut task = blob_client.put_block(
-                                frame.bytes(),
-                                Bytes::from(
-                                    gz_encoder.finish().expect("should be able to compress"),
-                                ),
-                            );
+                            let mut task =
+                                blob_client.put_block(frame.bytes(), gz_encoder.into_inner());
                             if let Some(lease_id) = self.lease_id.as_ref() {
                                 task = task.lease_id(*lease_id);
                             }
@@ -551,10 +560,10 @@ impl Store {
                         }
                     }
 
-                    match std::io::Write::write_all(&mut buffer, frame.bytes().as_ref()) {
+                    match buffer.write_all(&frame.bytes()).await {
                         Ok(_) => {}
                         Err(err) => {
-                            event!(Level::ERROR, "Could not write to buffer, {err}");
+                            event!(Level::ERROR, "Could not write to encoder, {err}");
                         }
                     }
                 }
@@ -565,10 +574,7 @@ impl Store {
                 let encoder_frame = &extension_encoder.frames[pos];
 
                 // Prepend the object's store frame to the block list and upload it's frames
-                let mut upload = blob_client.put_block(
-                    encoder_frame.bytes(),
-                    Bytes::from(buffer.finish().expect("should be able to complete")),
-                );
+                let mut upload = blob_client.put_block(encoder_frame.bytes(), buffer.into_inner());
                 if let Some(lease_id) = self.lease_id.as_ref() {
                     upload = upload.lease_id(*lease_id);
                 }
@@ -580,7 +586,7 @@ impl Store {
         }
 
         // Handle control_device
-        
+
         let (upload, control_block) = self.put_control_device(interner, blob_client.clone()).await;
 
         upload_block_futures.push(upload);
@@ -597,9 +603,7 @@ impl Store {
         let mut block_list = BlockList {
             blocks: objects.concat(),
         };
-        block_list
-            .blocks
-            .insert(0, control_block);
+        block_list.blocks.insert(0, control_block);
 
         let mut request = blob_client.put_block_list(block_list);
         if let Some(lease_id) = self.lease_id {
@@ -615,11 +619,20 @@ impl Store {
     }
 
     /// Start a stream upload of the store,
-    /// 
+    ///
     /// Returns a StoreStream which can be configured by calling .start(), and passing in a select fn,
     ///
-    pub fn create_stream(&mut self, prefix: impl AsRef<str>) -> StoreStream {
-        StoreStream::new(self, prefix)
+    pub fn create_stream(&mut self, prefix: impl AsRef<str>) -> StoreStream<AzureBlockStore> {
+        let blob_client = self.get_blob_client(prefix);
+
+        let store_container = StoreContainer::new((), &self.protocol, &self.index);
+
+        StoreStream::new(store_container, AzureBlockStore::new(AzureBlockClient {
+            client: Arc::new(blob_client),
+            snapshot_id: None,
+            lease_id: None,
+            exists: true,
+        }))
     }
 
     /// Commits the store blob to a snapshot and returns the snapshot,
@@ -693,7 +706,7 @@ impl Store {
 
     /// Returns a store index,
     ///
-    pub async fn index(&self, prefix: impl AsRef<str>) -> Option<StoreIndex<AzureBlobClient>> {
+    pub async fn index(&self, prefix: impl AsRef<str>) -> Option<StoreIndex<AzureBlockClient>> {
         let container_client = self
             .container_client
             .as_ref()
@@ -704,24 +717,27 @@ impl Store {
             container_client.blob_client(format!("{}/{}", prefix.as_ref(), self.store_name));
         let blob_client = Arc::new(blob_client);
 
-        if let Some(block_list) = self.block_list(blob_client.clone()).await {
-            let mut index = StoreIndex::<AzureBlobClient>::new_azure(blob_client, self.lease_id, self.snapshot.clone());
+        let mut index = AzureBlockStore::new(AzureBlockClient {
+            client: blob_client,
+            snapshot_id: self.snapshot.clone(),
+            lease_id: self.lease_id,
+            exists: true,
+        });
+        index.load_interner().await;
 
-            index.index(block_list).await;
+        let mut index = index.index().expect("should have an index");
+        index.index().await;
 
-            Some(index)
-        } else {
-            None
-        }
+        Some(index)
     }
 }
 
 impl Store {
     /// Registers a filesystem by name,
-    /// 
+    ///
     pub fn register_filesystem(&mut self, name: impl AsRef<str>) -> ResourceId {
         let resource_id = reality::wire::ResourceId::new_with_dynamic_id::<Filesystem>(
-           Interner::default().add_ident(name.as_ref()),
+            Interner::default().add_ident(name.as_ref()),
         );
 
         self.register_with(resource_id.clone(), name);
@@ -736,10 +752,14 @@ impl Store {
     ) -> Interner {
         let mut control_device = ControlDevice::default();
 
-        let mut buffer = [0; 64];
-        while let Ok(r) = reader.read_exact(&mut buffer).await {
+        let mut frame_buffer = FrameBuffer::new(100);
+
+        let mut b = frame_buffer.next();
+        while let Ok(r) = reader.read_exact(b.as_mut()).await {
             assert_eq!(r, 64);
-            let frame = Frame::from(buffer.as_ref());
+            let frame = Frame::from(b.freeze());
+            b = frame_buffer.next();
+
             if frame.op() == 0x00 {
                 control_device.data.push(frame.clone());
             } else if frame.op() > 0x00 && frame.op() < 0x06 {
@@ -751,7 +771,6 @@ impl Store {
                 );
                 control_device.index.push(frame.clone());
             }
-            buffer = [0; 64];
         }
 
         control_device.into()
@@ -762,30 +781,47 @@ impl Store {
 ///
 impl Store {
     /// Upload a control device block, returns the request future and block type,
-    /// 
-    pub async fn put_control_device(&self, interner: Interner, blob_client: Arc<BlobClient>) -> (PutBlock, BlobBlockType)  {
+    ///
+    pub async fn put_control_device(
+        &self,
+        interner: Interner,
+        blob_client: Arc<BlobClient>,
+    ) -> (PutBlock, BlobBlockType) {
         // Handle control_device
         let control_device = ControlDevice::new(interner);
         let control_frame = Frame::extension("store", "control");
-        let mut buffer = GzEncoder::new(vec![], Compression::fast());
+        let buf = vec![];
+        let mut buffer = async_compression::tokio::write::GzipEncoder::with_quality(
+            buf,
+            async_compression::Level::Fastest,
+        );
         for d in control_device.data {
-            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
+            buffer
+                .write_all(d.bytes().as_ref())
+                .await
+                .expect("should be able to write");
         }
         for d in control_device.read {
-            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
+            buffer
+                .write_all(d.bytes().as_ref())
+                .await
+                .expect("should be able to write");
         }
         for d in control_device.index {
-            std::io::Write::write_all(&mut buffer, d.bytes().as_ref()).expect("should be able to write");
+            buffer
+                .write_all(d.bytes().as_ref())
+                .await
+                .expect("should be able to write");
         }
-        let mut upload = blob_client.put_block(
-            control_frame.bytes(),
-            buffer.finish().expect("should be able to compress"),
-        );
+        let mut upload = blob_client.put_block(control_frame.bytes(), buffer.into_inner());
         if let Some(lease_id) = self.lease_id {
             upload = upload.lease_id(lease_id)
         }
 
-        (upload.into_future(), BlobBlockType::new_uncommitted(control_frame.bytes()))
+        (
+            upload.into_future(),
+            BlobBlockType::new_uncommitted(control_frame.bytes()),
+        )
     }
 
     /// Returns the current block list,
@@ -862,22 +898,15 @@ impl Store {
                     Ok(r) => {
                         // Note: Since this is a ranged query, there shouldn't be an additional call
                         let reader = r.data.collect().await.expect("should be able to read");
-                        let mut reader = GzDecoder::new(reader.as_ref());
-                        let mut buffer = vec![];
+                        let mut decoder =
+                            async_compression::tokio::write::GzipDecoder::new(&mut writer);
 
-                        match reader.read_to_end(&mut buffer) {
-                            Ok(read) => {
-                                event!(Level::TRACE, "Decoded {read} bytes");
+                        match tokio::io::copy(&mut reader.as_ref(), &mut decoder).await {
+                            Ok(copied) => {
+                                event!(Level::TRACE, "Copied {copied} bytes to decoder");
                             }
                             Err(err) => {
-                                event!(Level::ERROR, "Could not decode bytes, {err}");
-                            }
-                        }
-
-                        match writer.write_all(buffer.as_slice()).await {
-                            Ok(_) => {}
-                            Err(err) => {
-                                event!(Level::ERROR, "Could not write bytes {err}");
+                                event!(Level::ERROR, "Error copying bytes to decoder {err}");
                             }
                         }
                     }

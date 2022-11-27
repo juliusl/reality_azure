@@ -5,20 +5,18 @@ use std::{
 };
 
 use bytes::Bytes;
-use flate2::read::GzDecoder;
 use reality::{
+    store::{StoreEntry, Streamer, Blob},
     wire::{Decoder, Encoder, Frame, Interner},
     Value,
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, BufReader},
 };
 use tokio_stream::StreamExt;
 use tokio_tar::{Archive, Builder, Header};
 use tracing::{event, Level};
-
-use crate::{index::Entry, Blob, Streamer};
 
 /// Struct for encoding/decoding a filesystem to/from the store,
 ///
@@ -33,37 +31,38 @@ pub struct Filesystem {
 impl Filesystem {
     /// Opens a compressed archive,
     ///
-    pub fn open_tar_gz(path: impl AsRef<str>) -> Option<Self> {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .open(path.as_ref())
-        {
+    pub async fn open_tar_gz(path: impl AsRef<str>) -> Option<Self> {
+        match tokio::fs::File::open(path.as_ref()).await {
             Ok(stream) => {
-                let (reader, mut writer) = tokio::io::duplex(4096);
+                let (reader, mut writer) = tokio::io::duplex(8 * 1024);
 
                 tokio::spawn(async move {
-                    let mut gz = GzDecoder::new(stream);
-                    let mut buf = vec![];
-                    if let Ok(_) = gz.read_to_end(&mut buf) {
-                        match writer.write_all(&buf).await {
-                            Ok(_) => {
-                                
-                            },
-                            Err(err) => {
-                                event!(Level::ERROR, "Error writing buf, {err}");
-                            },
+                    let mut decoder =
+                        async_compression::tokio::write::GzipDecoder::new(&mut writer);
+
+                    let mut reader = BufReader::new(stream);
+                    
+                    match tokio::io::copy_buf(&mut reader, &mut decoder).await {
+                        Ok(copied) => {
+                            event!(Level::TRACE, "Decoded {copied} bytes");
+                        }
+                        Err(err) => {
+                            event!(Level::ERROR, "Error decoding stream, {err}");
                         }
                     }
+
+                    reader.shutdown().await.expect("should be able to shutdown reader");
+                    decoder.shutdown().await.expect("should be able to shutdown the decoder");
                 });
 
                 Some(Self {
                     archive: Some(ArchiveSource::Stream(reader)),
                 })
-            },
+            }
             Err(err) => {
                 event!(Level::ERROR, "Could not load tar.gz, {err}");
                 None
-            },
+            }
         }
     }
 
@@ -280,7 +279,7 @@ impl Filesystem {
                                     .to_str()
                                     .expect("should be a string")
                                     .to_string();
-                                let size = header.entry_size().expect("should have a size");
+                                let size = header.size().expect("should have a size");
                                 interner.add_ident(&path);
 
                                 let mut buf = entry.header().as_bytes().to_vec();
@@ -344,8 +343,13 @@ impl Filesystem {
 
     /// Writes an archive to writer, w/ the parent fs entry
     ///
-    pub async fn write_to<Client: reality::wire::BlobClient, W: AsyncWrite + Unpin + Send + 'static>(parent_entry: &Entry<Client>, writer: W) -> std::io::Result<()> 
-    {
+    pub async fn write_to<
+        Client: reality::wire::BlockClient,
+        W: AsyncWrite + Unpin + Send + 'static,
+    >(
+        parent_entry: &StoreEntry<Client>,
+        writer: W,
+    ) -> std::io::Result<()> {
         let builder = Builder::new(writer);
 
         let builder = parent_entry
@@ -375,8 +379,11 @@ impl Filesystem {
                 builder
             })
             .await;
-        
-        let mut builder = builder.into_inner().await.expect("should be able to get inner");
+
+        let mut builder = builder
+            .into_inner()
+            .await
+            .expect("should be able to get inner");
         builder.shutdown().await
     }
 }
